@@ -300,9 +300,56 @@ export default function CarIntelDashboard() {
                     {deal.deal_score?.toFixed(1)}
                   </div>
                   <div>
-                    <div style={{ fontSize:13, fontWeight:500, color:"#e2e8f0" }}>{deal.year} {deal.make} {deal.model}</div>
-                    <div style={{ fontSize:11, color:"#475569", marginTop:2 }}>{deal.trim}</div>
+                  <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                    {deal.url ? (
+                      <a
+                        href={deal.url}
+                        target="_blank"
+                        rel="noreferrer"
+                        onClick={(e) => e.stopPropagation()} // prevent opening the modal when clicking the link
+                        style={{
+                          fontSize: 13,
+                          fontWeight: 500,
+                          color: "#e2e8f0",
+                          textDecoration: "none",
+                        }}
+                        onMouseEnter={(e) => (e.currentTarget.style.textDecoration = "underline")}
+                        onMouseLeave={(e) => (e.currentTarget.style.textDecoration = "none")}
+                      >
+                        {deal.year} {deal.make} {deal.model}
+                      </a>
+                    ) : (
+                      <div style={{ fontSize: 13, fontWeight: 500, color: "#e2e8f0" }}>
+                        {deal.year} {deal.make} {deal.model}
+                      </div>
+                    )}
+
+                    {deal.url && (
+                      <a
+                        href={deal.url}
+                        target="_blank"
+                        rel="noreferrer"
+                        onClick={(e) => e.stopPropagation()}
+                        title="Open original listing"
+                        style={{
+                          fontFamily: "monospace",
+                          fontSize: 12,
+                          color: "#64748b",
+                          textDecoration: "none",
+                          border: "1px solid #1e3a4a",
+                          padding: "1px 6px",
+                          borderRadius: 4,
+                        }}
+                      >
+                        ↗
+                      </a>
+                    )}
                   </div>
+
+                  <div style={{ fontSize: 11, color: "#475569", marginTop: 2 }}>
+                    {deal.trim}
+                  </div>
+                </div>
                   <div style={{ fontFamily:"'JetBrains Mono',monospace", fontSize:13, fontWeight:700, color:"#e2e8f0" }}>{fmt$(deal.price)}</div>
                   <div style={{ fontFamily:"'JetBrains Mono',monospace", fontSize:12, color:"#64748b" }}>{fmt$(deal.predicted_price)}</div>
                   <div style={{ fontFamily:"'JetBrains Mono',monospace", fontSize:12, color:(deal.savings >= 0 ? "#22c55e" : "#ef4444"), fontWeight:600 }}>
