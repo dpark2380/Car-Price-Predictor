@@ -19,6 +19,7 @@ class CarListing(Base):
     model          = Column(String)
     trim           = Column(String)
     body_style     = Column(String)
+    body_type      = Column(String, nullable=True)
     condition      = Column(String)
     exterior_color = Column(String)
     price          = Column(Float)

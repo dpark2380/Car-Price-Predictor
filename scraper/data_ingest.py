@@ -6,7 +6,6 @@ import os
 import time
 import random
 import hashlib
-from datetime import datetime
 
 import requests
 from dotenv import load_dotenv
@@ -15,7 +14,7 @@ from loguru import logger
 load_dotenv()
 
 API_KEY = os.getenv("MARKETCHECK_API_KEY", "")
-ZIP     = os.getenv("MARKETCHECK_ZIP", "93440")   # Change this to switch markets
+ZIP     = os.getenv("MARKETCHECK_ZIP", "94119")   # Change this to switch markets
 RADIUS  = int(os.getenv("MARKETCHECK_RADIUS", 100))
 BASE    = "https://mc-api.marketcheck.com/v2"
 
@@ -27,6 +26,64 @@ def _make_listing_id(listing: dict) -> str:
     if not raw:
         raw = hashlib.md5(str(listing).encode()).hexdigest()
     return raw
+
+
+def extract_body_type(raw: dict) -> str | None:
+    """
+    Extract body type from Marketcheck-like payloads.
+    Tries multiple common keys and nested locations.
+    """
+    build = raw.get("build") or {}
+
+    candidate = (
+        build.get("body_type")
+        or build.get("body_style")
+        or build.get("body_subtype")
+        or raw.get("body_type")
+        or raw.get("body_style")
+        or raw.get("vehicle_type")
+        or raw.get("type")
+    )
+
+    if not candidate:
+        return None
+
+    s = str(candidate).strip()
+    return s or None
+
+
+def normalize_body_type(bt: str | None) -> str | None:
+    """
+    Normalize common variations so filtering is consistent.
+    """
+    if not bt:
+        return None
+
+    s = bt.strip().lower()
+
+    aliases = {
+        # SUVs
+        "sport utility": "SUV",
+        "sport utility vehicle": "SUV",
+        "suv": "SUV",
+        "crossover": "SUV",
+
+        # Passenger cars
+        "sedan": "Sedan",
+        "coupe": "Coupe",
+        "hatchback": "Hatchback",
+        "wagon": "Wagon",
+        "convertible": "Convertible",
+
+        # Trucks/Vans
+        "pickup": "Truck",
+        "pickup truck": "Truck",
+        "truck": "Truck",
+        "van": "Van",
+        "minivan": "Van",
+    }
+
+    return aliases.get(s, bt.strip())
 
 
 def map_listing(raw: dict, source: str = "marketcheck") -> dict | None:
@@ -48,28 +105,35 @@ def map_listing(raw: dict, source: str = "marketcheck") -> dict | None:
 
         listing_id = _make_listing_id(raw)
 
+        body_type = normalize_body_type(extract_body_type(raw))
+
         return {
-            "listing_id":    listing_id,
-            "vin":           raw.get("vin"),
-            "url":           raw.get("vdp_url") or raw.get("dealer_vdp_url"),
-            "scrape_source": source,
-            "year":          int(year),
-            "make":          str(make),
-            "model":         str(model),
-            "trim":          build.get("trim"),
-            "body_style":    build.get("body_type"),
-            "condition":     raw.get("car_type", "used"),
-            "exterior_color":raw.get("exterior_color"),
-            "price":         float(price),
-            "mileage":       int(mileage),
-            "accident_count":extra.get("accident_count", 0) or 0,
-            "owner_count":   extra.get("owner_count", 1) or 1,
-            "dealer_name":   dealer.get("name"),
-            "dealer_rating": dealer.get("rating"),
-            "location_city": dealer.get("city"),
-            "location_state":dealer.get("state"),
-            "location_zip":  dealer.get("zip"),
-            "days_listed":   raw.get("dom", 0) or 0,
+            "listing_id":     listing_id,
+            "vin":            raw.get("vin"),
+            "url":            raw.get("vdp_url") or raw.get("dealer_vdp_url"),
+            "scrape_source":  source,
+            "year":           int(year),
+            "make":           str(make),
+            "model":          str(model),
+            "trim":           build.get("trim"),
+
+            # NEW (preferred)
+            "body_type":      body_type,
+            # Keep existing field for backwards compatibility with your DB/schema
+            "body_style":     body_type,
+
+            "condition":      raw.get("car_type", "used"),
+            "exterior_color": raw.get("exterior_color"),
+            "price":          float(price),
+            "mileage":        int(mileage),
+            "accident_count": extra.get("accident_count", 0) or 0,
+            "owner_count":    extra.get("owner_count", 1) or 1,
+            "dealer_name":    dealer.get("name"),
+            "dealer_rating":  dealer.get("rating"),
+            "location_city":  dealer.get("city"),
+            "location_state": dealer.get("state"),
+            "location_zip":   dealer.get("zip"),
+            "days_listed":    raw.get("dom", 0) or 0,
         }
     except Exception as e:
         logger.warning(f"map_listing failed: {e}")

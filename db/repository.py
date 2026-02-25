@@ -7,6 +7,7 @@ Abstracts all DB interactions so other modules stay clean.
 from __future__ import annotations
 
 from datetime import datetime, timedelta
+from sqlalchemy.exc import IntegrityError
 
 import pandas as pd
 from loguru import logger
@@ -25,40 +26,58 @@ class ListingRepository:
     def upsert_listings(self, listings: list[dict]) -> tuple[int, int]:
         """
         Insert new listings; update last_seen + days_listed for existing ones.
-        Returns (inserted, updated) counts.
+        listing_id is globally unique (DB constraint), so we upsert by listing_id only.
+        Returns (inserted, updated).
         """
         inserted = updated = 0
         now = datetime.utcnow()
 
         for data in listings:
             listing_id = data.get("listing_id")
-            scrape_source = data.get("scrape_source", "cars.com")
             if not listing_id:
                 continue
 
             existing = (
                 self.session.query(CarListing)
-                .filter_by(listing_id=listing_id, scrape_source=scrape_source)
+                .filter_by(listing_id=listing_id)
                 .first()
             )
 
             if existing:
+                # Update fields
                 existing.last_seen = now
-                existing.is_active = True
-                if data.get("price") is not None:
-                    existing.price = data.get("price", existing.price)
+                existing.is_active = 1
+
+                # optionally update scrape_source to latest seen (or keep original)
+                if data.get("scrape_source"):
+                    existing.scrape_source = data.get("scrape_source", existing.scrape_source)
+
+                for k, v in data.items():
+                    if k in {"id", "listing_id"}:
+                        continue
+                    if hasattr(existing, k) and v is not None:
+                        setattr(existing, k, v)
+
                 if existing.first_seen:
                     existing.days_listed = (now - existing.first_seen).days
+
                 updated += 1
             else:
-                listing = CarListing(**{
-                    k: v for k, v in data.items()
-                    if hasattr(CarListing, k)
-                })
-                self.session.add(listing)
-                inserted += 1
+                try:
+                    listing = CarListing(**{k: v for k, v in data.items() if hasattr(CarListing, k)})
+                    self.session.add(listing)
+                    inserted += 1
+                except Exception as e:
+                    logger.warning(f"Failed to add listing {listing_id}: {e}")
 
-        self.session.commit()
+        try:
+            self.session.commit()
+        except IntegrityError as e:
+            # Safety net: if anything slipped through, rollback so session can continue
+            self.session.rollback()
+            logger.warning(f"IntegrityError during upsert_listings, rolled back: {e}")
+            # Optional: you can re-run inserts one-by-one here, but usually the lookup fix prevents this.
+
         logger.info(f"Upsert complete: {inserted} inserted, {updated} updated")
         return inserted, updated
 

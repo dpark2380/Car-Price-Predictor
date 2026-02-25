@@ -65,11 +65,13 @@ def deals():
     Query params:
       - min_score: minimum deal_score to include (default 0)
       - make/model: substring filters
+      - body: body type filter (e.g. SUV, Sedan, Truck). Use "unknown" for NULLs.
     """
     limit     = int(request.args.get("limit", 100))
     min_score = float(request.args.get("min_score", 0))
     make      = request.args.get("make", "").strip().lower()
     model_q   = request.args.get("model", "").strip().lower()
+    body_q    = request.args.get("body", "").strip().lower()  # NEW
 
     session = get_db()
     try:
@@ -85,12 +87,26 @@ def deals():
         df["predicted_price"] = pd.to_numeric(df.get("predicted_price"), errors="coerce")
         df["deal_score"] = pd.to_numeric(df.get("deal_score"), errors="coerce")
 
+        # Ensure body_type exists as a column, even if missing
+        if "body_type" not in df.columns:
+            df["body_type"] = None
+
         df["savings"] = (df["predicted_price"] - df["price"]).round(0)
 
         if make:
             df = df[df["make"].astype(str).str.lower().str.contains(make, na=False)]
         if model_q:
             df = df[df["model"].astype(str).str.lower().str.contains(model_q, na=False)]
+
+        # NEW: Body type filter
+        # - body=unknown filters for NULL/empty
+        # - otherwise substring match (case-insensitive)
+        if body_q:
+            bt = df["body_type"].astype(str).str.strip()
+            if body_q in {"unknown", "null", "(null)", "none"}:
+                df = df[df["body_type"].isna() | (bt == "") | (bt.str.lower() == "nan")]
+            else:
+                df = df[bt.str.lower().str.contains(body_q, na=False)]
 
         # Apply min_score again after filters (defensive)
         df = df[df["deal_score"].fillna(-1) >= min_score]
@@ -107,6 +123,7 @@ def deals():
                 "make":            row.get("make"),
                 "model":           row.get("model"),
                 "trim":            ss(row.get("trim")),
+                "body_type":       ss(row.get("body_type")),  # NEW
                 "price":           sf(row.get("price")),
                 "predicted_price": sf(row.get("predicted_price")),
                 "savings":         sf(row.get("savings")),
@@ -249,6 +266,7 @@ def listings():
                 "deal_score":      score if score is not None else 50.0,
                 "deal_label":      row.get("deal_label") or "Fair Price",
                 "predicted_price": sf(row.get("predicted_price")),
+                "body_type":       ss(row.get("body_type")),  # NEW (optional for tooltip/filtering)
             })
         return jsonify(records)
     finally:
