@@ -10,6 +10,9 @@ from db.repository import ListingRepository, PredictionRepository, PopularityRep
 from scraper.data_ingest import DataIngestor
 from ml import pipeline
 
+from scraper.api_usage import get_calls_today
+from loguru import logger
+
 
 def load_targets(path: str = "config/search_targets.json") -> list[dict]:
     import json
@@ -59,7 +62,7 @@ def scrape_job(
         from scraper.data_ingest import map_listing
 
         mc = MarketCheckEnrichment()
-        recents = mc.get_recent_listings(rows=50) or []
+        recents = mc.get_recent_listings(rows=200) or []
         if recents:
             mapped = [map_listing(r, "recents") for r in recents]
             cleaned = [l for l in mapped if l is not None and l.get("listing_id")]
@@ -172,6 +175,8 @@ def main():
     else:
         logger.info("Running all jobs once…")
         run_all(engine)
+    
+    logger.info(f"📊 Marketcheck API calls today: {get_calls_today('marketcheck')}")
 
 
 if __name__ == "__main__":

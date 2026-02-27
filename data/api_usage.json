@@ -1,0 +1,15 @@
+{
+  "days": {
+    "2026-02-27": {
+      "endpoints": {
+        "/search/car/active": 1,
+        "/search/car/recents": 1
+      },
+      "providers": {
+        "marketcheck": 2
+      },
+      "total": 2
+    }
+  },
+  "total": 2
+}
