@@ -5,6 +5,13 @@ import pandas as pd
 from datetime import datetime
 from loguru import logger
 
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import mean_absolute_error, mean_squared_error
+from sklearn.linear_model import LinearRegression
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.inspection import permutation_importance
+
+
 try:
     from xgboost import XGBRegressor
     HAS_XGB = True
@@ -52,9 +59,6 @@ def _build_features_raw(df: pd.DataFrame) -> pd.DataFrame:
 
     out["accident_count"] = pd.to_numeric(df.get("accident_count", 0), errors="coerce").fillna(0)
     out["owner_count"] = pd.to_numeric(df.get("owner_count", 1), errors="coerce").fillna(1)
-
-    # If dealer_rating is totally missing, keep it but it won’t help; imputer will handle.
-    out["dealer_rating"] = pd.to_numeric(df.get("dealer_rating", np.nan), errors="coerce")
 
     # --- categoricals (strings) ---
     out["make"] = df["make"].astype(str).str.lower().str.strip()
@@ -106,7 +110,9 @@ def _build_features_raw(df: pd.DataFrame) -> pd.DataFrame:
 def train(df: pd.DataFrame) -> dict | None:
     logger.info("Starting model training run…")
 
-    # Basic required fields
+    # -----------------------------
+    # 1) Clean + filter
+    # -----------------------------
     df = df.dropna(subset=["price", "mileage", "year", "make", "model"]).copy()
     df["price"] = pd.to_numeric(df["price"], errors="coerce")
     df["mileage"] = pd.to_numeric(df["mileage"], errors="coerce")
@@ -117,17 +123,24 @@ def train(df: pd.DataFrame) -> dict | None:
     df = df[df["mileage"].between(0, 400_000)]
 
     if len(df) < MIN_TRAINING_SAMPLES:
-        logger.warning(f"Not enough data to train ({len(df)} rows, need {MIN_TRAINING_SAMPLES})")
+        logger.warning(
+            f"Not enough data to train ({len(df)} rows, need {MIN_TRAINING_SAMPLES})"
+        )
         return None
 
+    # -----------------------------
+    # 2) Build features + split
+    # -----------------------------
     X_raw = _build_features_raw(df)
     y = df["price"]
 
-    from sklearn.model_selection import train_test_split
     X_train, X_test, y_train, y_test = train_test_split(
         X_raw, y, test_size=0.2, random_state=42
     )
 
+    # -----------------------------
+    # 3) Preprocess
+    # -----------------------------
     numeric_features = [
         "year", "vehicle_age", "age_sq", "log_age",
         "mileage", "log_mileage", "miles_per_year",
@@ -157,8 +170,22 @@ def train(df: pd.DataFrame) -> dict | None:
         remainder="drop",
     )
 
+    # -----------------------------
+    # 4) Compare models (baseline + RF)
+    #    (keep XGB as an optional third competitor)
+    # -----------------------------
+    candidates: dict[str, object] = {
+        "linear": LinearRegression(),
+        "rf": RandomForestRegressor(
+            n_estimators=300,
+            random_state=42,
+            n_jobs=-1,
+            min_samples_leaf=2,
+        ),
+    }
+
     if HAS_XGB:
-        base_model = XGBRegressor(
+        candidates["xgb"] = XGBRegressor(
             n_estimators=800,
             max_depth=5,
             learning_rate=0.05,
@@ -168,78 +195,128 @@ def train(df: pd.DataFrame) -> dict | None:
             verbosity=0,
             objective="reg:squarederror",
         )
-    else:
-        # sklearn fallback
-        base_model = GradientBoostingRegressor(n_estimators=300, random_state=42)
 
-    pipe = Pipeline(steps=[
-        ("preprocess", preprocess),
-        ("model", base_model),
-    ])
-
-    # Train on log(price) for stability
+    # log-space training target
     y_log_train = np.log1p(y_train)
 
-    # Weight luxury cars more so the model stops regressing them to the mean
+    # luxury weighting (only applied to models that support sample_weight)
     lux_w = 2.0
-    sample_weight = np.where(X_train["is_luxury"].to_numpy() == 1.0, lux_w, 1.0)
+    sample_weight = np.where(
+        X_train["is_luxury"].to_numpy() >= 0.5, lux_w, 1.0
+    )
 
-    if HAS_XGB:
-        pipe.fit(X_train, y_log_train, model__sample_weight=sample_weight)
-    else:
-        # GradientBoostingRegressor supports sample_weight too
-        pipe.fit(X_train, y_log_train, model__sample_weight=sample_weight)
+    def _eval(y_true_np: np.ndarray, y_pred_np: np.ndarray) -> tuple[float, float]:
+        mae = float(mean_absolute_error(y_true_np, y_pred_np))
+        rmse = float(np.sqrt(mean_squared_error(y_true_np, y_pred_np)))
+        return mae, rmse
 
-    # Evaluate in original $ space
-    # -----------------------------
-    preds = None
-    y_true = None
+    fitted: dict[str, Pipeline] = {}
+    metrics: dict[str, dict] = {}
 
-    try:
-        preds = np.expm1(pipe.predict(X_test))
+    for name, model in candidates.items():
+        pipe = Pipeline(steps=[
+            ("preprocess", preprocess),
+            ("model", model),
+        ])
+
+        # fit with sample_weight when supported
+        fit_kwargs = {}
+        if name in ("rf", "xgb"):  # linear baseline doesn't use sample_weight here
+            fit_kwargs["model__sample_weight"] = sample_weight
+
+        pipe.fit(X_train, y_log_train, **fit_kwargs)
+
+        pred = np.expm1(pipe.predict(X_test))
         y_true = y_test.to_numpy()
 
-        mae = float(np.mean(np.abs(preds - y_true)))
+        mae, rmse = _eval(y_true, pred)
 
-        ss_res = float(np.sum((y_true - preds) ** 2))
-        ss_tot = float(np.sum((y_true - y_true.mean()) ** 2))
-        r2 = 1 - ss_res / ss_tot if ss_tot > 0 else 0.0
+        # slice MAE: luxury vs non-lux
+        test_is_lux = (X_test["is_luxury"].to_numpy() >= 0.5)
+        lux_n = int(test_is_lux.sum())
+        nonlux_n = int((~test_is_lux).sum())
 
-        logger.info(f"Price model trained | MAE=${mae:,.0f} R²={r2:.3f}")
+        lux_mae = float(
+            np.mean(np.abs(pred[test_is_lux] - y_true[test_is_lux]))
+        ) if lux_n > 0 else float("nan")
 
-        # -----------------------------
-        # Slice diagnostics (luxury)
-        # -----------------------------
-        try:
-            # X_test is a DataFrame because you split X_raw (a DataFrame)
-            test_is_lux = (X_test["is_luxury"].to_numpy() >= 0.5)
+        nonlux_mae = float(
+            np.mean(np.abs(pred[~test_is_lux] - y_true[~test_is_lux]))
+        ) if nonlux_n > 0 else float("nan")
 
-            lux_n = int(test_is_lux.sum())
-            nonlux_n = int((~test_is_lux).sum())
+        fitted[name] = pipe
+        metrics[name] = {
+            "mae": mae,
+            "rmse": rmse,
+            "luxury_n": lux_n,
+            "nonlux_n": nonlux_n,
+            "luxury_mae": lux_mae,
+            "nonlux_mae": nonlux_mae,
+        }
 
-            lux_mae = float(np.mean(np.abs(preds[test_is_lux] - y_true[test_is_lux]))) if lux_n > 0 else float("nan")
-            nonlux_mae = float(np.mean(np.abs(preds[~test_is_lux] - y_true[~test_is_lux]))) if nonlux_n > 0 else float("nan")
+        logger.info(
+            f"Candidate {name} | MAE=${mae:,.0f} RMSE=${rmse:,.0f} | "
+            f"luxury=${lux_mae:,.0f} (n={lux_n}) nonlux=${nonlux_mae:,.0f} (n={nonlux_n})"
+        )
 
-            logger.info(
-                f"Slice MAE | luxury_n={lux_n} nonlux_n={nonlux_n} | "
-                f"luxury=${lux_mae:,.0f} nonlux=${nonlux_mae:,.0f}"
-            )
-        except Exception as e:
-            logger.warning(f"Luxury slice MAE calc failed: {e}")
+    # pick best by MAE
+    best_name = min(metrics.keys(), key=lambda k: metrics[k]["mae"])
+    pipe = fitted[best_name]
+    best = metrics[best_name]
+
+    logger.info(
+        f"Selected model: {best_name} | MAE=${best['mae']:,.0f} RMSE=${best['rmse']:,.0f}"
+    )
+
+    # -----------------------------
+    # 5) Feature importance (permutation importance on log-space target)
+    # -----------------------------
+    try:
+        pi = permutation_importance(
+            pipe,
+            X_test,                  # RAW df (24 cols)
+            np.log1p(y_test),         # log-space target
+            n_repeats=5,
+            random_state=42,
+            n_jobs=-1,
+            scoring="neg_mean_absolute_error",
+        )
+
+        imp = (
+            pd.Series(pi.importances_mean, index=X_test.columns)
+            .sort_values(ascending=False)
+        )
+
+        logger.info("Top permutation importances (raw features):\n" + imp.head(20).to_string())
 
     except Exception as e:
-        logger.exception(f"Evaluation failed: {e}")
-        return None
+        logger.warning(f"Permutation importance failed: {e}")
 
+    # -----------------------------
+    # 6) Save
+    # -----------------------------
     version = datetime.utcnow().strftime("%Y%m%d_%H%M")
-    payload = {"model": pipe, "version": version}
+    payload = {
+        "model": pipe,
+        "version": version,
+        "selected_model": best_name,
+        "metrics": metrics,
+    }
 
     os.makedirs("models", exist_ok=True)
     joblib.dump(payload, MODEL_PATH)
 
-    logger.info(f"Price model trained | MAE=${mae:,.0f} R²={r2:.3f}")
-    logger.info(f"Saved model → {MODEL_PATH}")
-    return {"mae": mae, "r2": r2, "version": version, "n": int(len(df))}
+    logger.info(
+        f"Saved model → {MODEL_PATH} | selected={best_name} "
+        f"MAE=${best['mae']:,.0f} RMSE=${best['rmse']:,.0f}"
+    )
+
+    return {
+        "version": version,
+        "selected_model": best_name,
+        "metrics": metrics,
+        "n": int(len(df)),
+    }
 
 
 def load() -> dict | None:

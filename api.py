@@ -4,7 +4,7 @@ Run: PYTHONPATH=. python3 api.py
 """
 
 import math
-from datetime import datetime
+from datetime import datetime, timezone
 
 import pandas as pd
 from flask import Flask, jsonify, request
@@ -187,7 +187,7 @@ def stats():
             "price_min":       sf(df["price"].min()) if "price" in df else None,
             "price_max":       sf(df["price"].max()) if "price" in df else None,
             "avg_mileage":     sf(df["mileage"].mean()) if "mileage" in df else 0,
-            "last_updated":    datetime.utcnow().isoformat(),
+            "last_updated":    datetime.now(timezone.utc).isoformat()
         })
     finally:
         session.close()
@@ -271,46 +271,6 @@ def listings():
         return jsonify(records)
     finally:
         session.close()
-
-
-@app.route("/api/benchmark")
-def benchmark():
-    year    = request.args.get("year", type=int)
-    make    = request.args.get("make")
-    model   = request.args.get("model")
-    mileage = request.args.get("mileage", type=int, default=50000)
-    trim    = request.args.get("trim")
-
-    if not all([year, make, model]):
-        return jsonify({"error": "year, make, model required"}), 400
-    try:
-        from scraper.marketcheck_enrichment import MarketCheckEnrichment
-        result = MarketCheckEnrichment().predict_price(
-            year=year, make=make, model=model, miles=mileage, trim=trim
-        )
-        if not result:
-            return jsonify({"error": "No prediction available"}), 404
-        return jsonify(result)
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-
-@app.route("/api/sales-stats")
-def sales_stats():
-    make  = request.args.get("make")
-    model = request.args.get("model")
-    year  = request.args.get("year", type=int)
-
-    if not all([make, model]):
-        return jsonify({"error": "make and model required"}), 400
-    try:
-        from scraper.marketcheck_enrichment import MarketCheckEnrichment
-        result = MarketCheckEnrichment().get_sales_stats(make=make, model=model, year=year)
-        if not result:
-            return jsonify({"error": "No data available"}), 404
-        return jsonify(result)
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
 
 
 @app.route("/api/market-popular")

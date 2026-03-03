@@ -11,7 +11,6 @@ from scraper.data_ingest import DataIngestor
 from ml import pipeline
 
 from scraper.api_usage import get_calls_today
-from loguru import logger
 
 
 def load_targets(path: str = "config/search_targets.json") -> list[dict]:
@@ -136,9 +135,9 @@ def run_all(engine):
     pop = PopularityRepository(session)
     try:
         scrape_job(repo, pred, pop)
+        ml_train_job(repo)
         score_job(repo, pred)
         popularity_job(repo, pop)
-        ml_train_job(repo)
     finally:
         session.close()
 
@@ -148,6 +147,7 @@ def main():
     parser.add_argument("--once", action="store_true")
     parser.add_argument("--scrape-only", action="store_true")
     parser.add_argument("--train-only", action="store_true")
+    parser.add_argument("--score-only", action="store_true")
     args = parser.parse_args()
 
     engine = init_db()
@@ -158,25 +158,32 @@ def main():
             repo = ListingRepository(session)
             pred = PredictionRepository(session)
             pop = PopularityRepository(session)
-            scrape_job(repo, pred, pop)
-            score_job(repo, pred)
-            popularity_job(repo, pop)
+            scrape_job(repo, pred, pop)   # ONLY scrape
         finally:
             session.close()
+        return
 
-    elif args.train_only:
+    if args.train_only:
         session = get_session(engine)
         try:
             repo = ListingRepository(session)
-            ml_train_job(repo)
+            ml_train_job(repo)           # ONLY train
         finally:
             session.close()
+        return
 
-    else:
-        logger.info("Running all jobs once…")
-        run_all(engine)
-    
-    logger.info(f"📊 Marketcheck API calls today: {get_calls_today('marketcheck')}")
+    if args.score_only:
+        session = get_session(engine)
+        try:
+            repo = ListingRepository(session)
+            pred = PredictionRepository(session)
+            score_job(repo, pred)        # ONLY score
+        finally:
+            session.close()
+        return
+
+    logger.info("Running all jobs once…")
+    run_all(engine)
 
 
 if __name__ == "__main__":

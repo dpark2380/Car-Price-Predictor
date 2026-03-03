@@ -1,61 +1,10 @@
 import { useState, useEffect, useMemo } from "react";
+import { fmt$, fmtN, normalizeBodyType } from "./utils/format";
+import { getDealColor } from "./utils/scoreColor.js";
+import Spinner from "./components/common/Spinner";
+import DealBadge from "./components/deals/DealBadge";
 
 const API = "http://localhost:5001/api";
-const fmt$ = (n) => (n == null ? "—" : `$${Math.round(n).toLocaleString()}`);
-const fmtN = (n) => (n == null ? "—" : n.toLocaleString());
-
-/**
- * 0–100 scoring:
- *   100 = best deal (most under market)
- *   50  = fair price
- *   0   = worst deal (most over market)
- */
-function getDealColor(score) {
-  const s = score ?? 50;
-  if (s >= 90) return "#22c55e"; // Hidden Gem
-  if (s >= 75) return "#84cc16"; // Great Deal
-  if (s >= 60) return "#f59e0b"; // Good Deal
-  if (s >= 45) return "#94a3b8"; // Fair Price
-  return "#ef4444"; // Overpriced
-}
-
-function DealBadge({ label, score }) {
-  const color = getDealColor(score);
-  return (
-    <span
-      style={{
-        background: color + "22",
-        color,
-        border: `1px solid ${color}44`,
-        borderRadius: 3,
-        fontSize: 10,
-        fontFamily: "'JetBrains Mono', monospace",
-        padding: "2px 6px",
-        letterSpacing: "0.05em",
-        textTransform: "uppercase",
-        whiteSpace: "nowrap",
-      }}
-    >
-      {label}
-    </span>
-  );
-}
-
-function Spinner() {
-  return (
-    <div style={{ display: "flex", alignItems: "center", justifyContent: "center", padding: 60, gap: 12 }}>
-      <div style={{ width: 8, height: 8, borderRadius: "50%", background: "#ff6b2b", animation: "pulse 1s infinite" }} />
-      <div style={{ width: 8, height: 8, borderRadius: "50%", background: "#ff6b2b", animation: "pulse 1s 0.2s infinite" }} />
-      <div style={{ width: 8, height: 8, borderRadius: "50%", background: "#ff6b2b", animation: "pulse 1s 0.4s infinite" }} />
-    </div>
-  );
-}
-
-function normalizeBodyType(v) {
-  const s = (v ?? "").toString().trim();
-  if (!s || s.toLowerCase() === "nan") return "Unknown";
-  return s;
-}
 
 export default function CarIntelDashboard() {
   const [searchQuery, setSearchQuery] = useState("");
@@ -172,29 +121,12 @@ export default function CarIntelDashboard() {
   const handleSelectDeal = (deal) => {
     const next = selectedDeal?.listing_id === deal.listing_id ? null : deal;
     setSelectedDeal(next);
-    if (!next) {
-      setBenchmark(null);
-      setSalesStats(null);
-      return;
-    }
 
+    // Disable benchmark/sales panels + requests
     setBenchmark(null);
-    setBenchmarkLoading(true);
-    fetch(
-      `${API}/benchmark?year=${next.year}&make=${encodeURIComponent(next.make)}&model=${encodeURIComponent(next.model)}&mileage=${next.mileage}`
-    )
-      .then((r) => r.json())
-      .then(setBenchmark)
-      .catch(() => setBenchmark(null))
-      .finally(() => setBenchmarkLoading(false));
-
     setSalesStats(null);
-    setSalesLoading(true);
-    fetch(`${API}/sales-stats?make=${encodeURIComponent(next.make)}&model=${encodeURIComponent(next.model)}`)
-      .then((r) => r.json())
-      .then(setSalesStats)
-      .catch(() => setSalesStats(null))
-      .finally(() => setSalesLoading(false));
+    setBenchmarkLoading(false);
+    setSalesLoading(false);
   };
 
   return (
@@ -530,8 +462,6 @@ export default function CarIntelDashboard() {
                   <button
                     onClick={() => {
                       setSelectedDeal(null);
-                      setBenchmark(null);
-                      setSalesStats(null);
                     }}
                     style={{ background: "none", border: "1px solid #1e3a4a", color: "#475569", borderRadius: 4, padding: "6px 12px", cursor: "pointer", fontFamily: "monospace", fontSize: 11 }}
                   >

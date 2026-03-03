@@ -1,15 +1,17 @@
 {
   "days": {
-    "2026-02-27": {
+    "2026-03-02": {
       "endpoints": {
-        "/search/car/active": 1,
-        "/search/car/recents": 1
+        "/predict/car/price": 3,
+        "/sales/stats/car": 3,
+        "/search/car/active": 2,
+        "/search/car/recents": 2
       },
       "providers": {
-        "marketcheck": 2
+        "marketcheck": 10
       },
-      "total": 2
+      "total": 10
     }
   },
-  "total": 2
+  "total": 10
 }
