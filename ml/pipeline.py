@@ -123,9 +123,7 @@ def train(df: pd.DataFrame) -> dict | None:
     df = df[df["mileage"].between(0, 400_000)]
 
     if len(df) < MIN_TRAINING_SAMPLES:
-        logger.warning(
-            f"Not enough data to train ({len(df)} rows, need {MIN_TRAINING_SAMPLES})"
-        )
+        logger.warning(f"Not enough data to train ({len(df)} rows, need {MIN_TRAINING_SAMPLES})")
         return None
 
     # -----------------------------
@@ -137,6 +135,10 @@ def train(df: pd.DataFrame) -> dict | None:
     X_train, X_test, y_train, y_test = train_test_split(
         X_raw, y, test_size=0.2, random_state=42
     )
+
+    # log-space targets (this is what we train on)
+    y_train_log = np.log1p(y_train)
+    y_test_log = np.log1p(y_test)
 
     # -----------------------------
     # 3) Preprocess
@@ -171,8 +173,7 @@ def train(df: pd.DataFrame) -> dict | None:
     )
 
     # -----------------------------
-    # 4) Compare models (baseline + RF)
-    #    (keep XGB as an optional third competitor)
+    # 4) Candidates
     # -----------------------------
     candidates: dict[str, object] = {
         "linear": LinearRegression(),
@@ -196,14 +197,9 @@ def train(df: pd.DataFrame) -> dict | None:
             objective="reg:squarederror",
         )
 
-    # log-space training target
-    y_log_train = np.log1p(y_train)
-
-    # luxury weighting (only applied to models that support sample_weight)
+    # luxury weighting (LinearRegression + RF accept sample_weight; XGB accepts too)
     lux_w = 2.0
-    sample_weight = np.where(
-        X_train["is_luxury"].to_numpy() >= 0.5, lux_w, 1.0
-    )
+    sample_weight = np.where(X_train["is_luxury"].to_numpy() >= 0.5, lux_w, 1.0)
 
     def _eval(y_true_np: np.ndarray, y_pred_np: np.ndarray) -> tuple[float, float]:
         mae = float(mean_absolute_error(y_true_np, y_pred_np))
@@ -213,41 +209,53 @@ def train(df: pd.DataFrame) -> dict | None:
     fitted: dict[str, Pipeline] = {}
     metrics: dict[str, dict] = {}
 
+    # -----------------------------
+    # 5) Train + evaluate each candidate
+    # -----------------------------
     for name, model in candidates.items():
         pipe = Pipeline(steps=[
             ("preprocess", preprocess),
             ("model", model),
         ])
 
-        # fit with sample_weight when supported
-        fit_kwargs = {}
-        if name in ("rf", "xgb"):  # linear baseline doesn't use sample_weight here
-            fit_kwargs["model__sample_weight"] = sample_weight
+        fit_kwargs: dict = {"model__sample_weight": sample_weight}
 
-        pipe.fit(X_train, y_log_train, **fit_kwargs)
+        # IMPORTANT: only pass eval_set/verbose to XGB
+        if name == "xgb":
+            fit_kwargs.update({
+                "model__eval_set": [(pipe.named_steps["preprocess"].fit_transform(X_test), y_test_log)]
+                # ^ NOTE: eval_set must be in the model's feature space. But since we're in a Pipeline,
+                # we can't easily inject transformed X_test without fitting preprocess first.
+                # So, we DO NOT pass eval_set via the pipeline. We'll compute training metrics manually below.
+            })
 
-        pred = np.expm1(pipe.predict(X_test))
+        # Because passing eval_set through a sklearn Pipeline is awkward (needs transformed X),
+        # keep it simple: just fit the pipeline normally.
+        # (You still get proper test MAE/RMSE and train RMSE computed below.)
+        pipe.fit(X_train, y_train_log, model__sample_weight=sample_weight)
+
+        # ---- training RMSE (log-space) for ALL models (works consistently) ----
+        pred_train_log = pipe.predict(X_train)
+        train_rmse_log = float(np.sqrt(mean_squared_error(y_train_log.to_numpy(), pred_train_log)))
+
+        # ---- test metrics in $ space ----
+        pred_test = np.expm1(pipe.predict(X_test))
         y_true = y_test.to_numpy()
-
-        mae, rmse = _eval(y_true, pred)
+        mae, rmse = _eval(y_true, pred_test)
 
         # slice MAE: luxury vs non-lux
         test_is_lux = (X_test["is_luxury"].to_numpy() >= 0.5)
         lux_n = int(test_is_lux.sum())
         nonlux_n = int((~test_is_lux).sum())
 
-        lux_mae = float(
-            np.mean(np.abs(pred[test_is_lux] - y_true[test_is_lux]))
-        ) if lux_n > 0 else float("nan")
-
-        nonlux_mae = float(
-            np.mean(np.abs(pred[~test_is_lux] - y_true[~test_is_lux]))
-        ) if nonlux_n > 0 else float("nan")
+        lux_mae = float(np.mean(np.abs(pred_test[test_is_lux] - y_true[test_is_lux]))) if lux_n > 0 else float("nan")
+        nonlux_mae = float(np.mean(np.abs(pred_test[~test_is_lux] - y_true[~test_is_lux]))) if nonlux_n > 0 else float("nan")
 
         fitted[name] = pipe
         metrics[name] = {
             "mae": mae,
             "rmse": rmse,
+            "train_rmse_log": train_rmse_log,
             "luxury_n": lux_n,
             "nonlux_n": nonlux_n,
             "luxury_mae": lux_mae,
@@ -256,6 +264,7 @@ def train(df: pd.DataFrame) -> dict | None:
 
         logger.info(
             f"Candidate {name} | MAE=${mae:,.0f} RMSE=${rmse:,.0f} | "
+            f"trainRMSE(log)={train_rmse_log:.4f} | "
             f"luxury=${lux_mae:,.0f} (n={lux_n}) nonlux=${nonlux_mae:,.0f} (n={nonlux_n})"
         )
 
@@ -264,18 +273,16 @@ def train(df: pd.DataFrame) -> dict | None:
     pipe = fitted[best_name]
     best = metrics[best_name]
 
-    logger.info(
-        f"Selected model: {best_name} | MAE=${best['mae']:,.0f} RMSE=${best['rmse']:,.0f}"
-    )
+    logger.info(f"Selected model: {best_name} | MAE=${best['mae']:,.0f} RMSE=${best['rmse']:,.0f}")
 
     # -----------------------------
-    # 5) Feature importance (permutation importance on log-space target)
+    # 6) Permutation importance on RAW features (24 cols)
     # -----------------------------
     try:
         pi = permutation_importance(
             pipe,
-            X_test,                  # RAW df (24 cols)
-            np.log1p(y_test),         # log-space target
+            X_test,                  # raw features
+            y_test_log,              # log target (matches training)
             n_repeats=5,
             random_state=42,
             n_jobs=-1,
@@ -286,14 +293,13 @@ def train(df: pd.DataFrame) -> dict | None:
             pd.Series(pi.importances_mean, index=X_test.columns)
             .sort_values(ascending=False)
         )
-
         logger.info("Top permutation importances (raw features):\n" + imp.head(20).to_string())
 
     except Exception as e:
         logger.warning(f"Permutation importance failed: {e}")
 
     # -----------------------------
-    # 6) Save
+    # 7) Save
     # -----------------------------
     version = datetime.utcnow().strftime("%Y%m%d_%H%M")
     payload = {
@@ -306,10 +312,31 @@ def train(df: pd.DataFrame) -> dict | None:
     os.makedirs("models", exist_ok=True)
     joblib.dump(payload, MODEL_PATH)
 
-    logger.info(
-        f"Saved model → {MODEL_PATH} | selected={best_name} "
-        f"MAE=${best['mae']:,.0f} RMSE=${best['rmse']:,.0f}"
-    )
+    os.makedirs("models", exist_ok=True)
+    joblib.dump(payload, MODEL_PATH)
+
+    logger.info("\n" + "="*72)
+    logger.info(f"MODEL TRAINING SUMMARY  |  Version: {version}")
+    logger.info("="*72)
+
+    for name, m in metrics.items():
+        logger.info(
+            f"{name.upper():<8} | "
+            f"MAE=${m['mae']:>8,.0f}  "
+            f"RMSE=${m['rmse']:>8,.0f}  "
+            f"TrainRMSE(log)={m['train_rmse_log']:.4f}"
+        )
+        logger.info(
+            f"          Luxury MAE=${m['luxury_mae']:>8,.0f} (n={m['luxury_n']})  "
+            f"Non-Lux MAE=${m['nonlux_mae']:>8,.0f} (n={m['nonlux_n']})"
+        )
+        logger.info("-"*72)
+
+    logger.info(f"SELECTED MODEL → {best_name.upper()}")
+    logger.info(f"Rows after cleaning: {len(df)}")
+    logger.info(f"Train rows: {len(X_train)} | Test rows: {len(X_test)}")
+    logger.info(f"Train/Test split: {len(X_train)}/{len(X_test)}")
+    logger.info("="*72 + "\n")
 
     return {
         "version": version,

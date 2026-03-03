@@ -113,19 +113,19 @@ def popularity_job(repo: ListingRepository, pop_repo: PopularityRepository):
 
 def ml_train_job(repo: ListingRepository):
     logger.info("▶ ML train job starting")
+
     df = repo.get_active_listings_df()
     if df.empty:
         logger.warning("No data to train on")
         return
 
     result = pipeline.train(df)
-    if result:
-        try:
-            logger.info(f"  Train complete: MAE=${result['mae']:,.0f} R²={result['r2']:.3f}")
-        except Exception:
-            logger.info(f"  Train complete: {result}")
 
-    logger.info("▶ ML train job done")
+    if result is None:
+        logger.warning("Training did not run (insufficient data)")
+        return
+
+    logger.info("▶ ML train job complete")
 
 
 def run_all(engine):

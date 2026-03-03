@@ -4,14 +4,24 @@
       "endpoints": {
         "/predict/car/price": 3,
         "/sales/stats/car": 3,
-        "/search/car/active": 2,
-        "/search/car/recents": 2
+        "/search/car/active": 3,
+        "/search/car/recents": 3
       },
       "providers": {
-        "marketcheck": 10
+        "marketcheck": 12
       },
-      "total": 10
+      "total": 12
+    },
+    "2026-03-03": {
+      "endpoints": {
+        "/search/car/active": 2,
+        "/search/car/recents": 1
+      },
+      "providers": {
+        "marketcheck": 3
+      },
+      "total": 3
     }
   },
-  "total": 10
+  "total": 15
 }
