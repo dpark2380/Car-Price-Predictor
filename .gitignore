@@ -19,4 +19,8 @@ frontend/.env
 frontend/.env.*
 
 # OS
-.DS_Store
+.DS_Storedata/api_usage.json
+data/page_cursor.json
+data/zip_cursor.json
+data/main_zip_cursor.json
+data/cursors/
