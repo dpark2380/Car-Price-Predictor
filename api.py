@@ -78,7 +78,7 @@ def deals():
         repo = PredictionRepository(session)
 
         # Pull a bunch, then filter/sort in API
-        df = repo.get_top_deals(limit=1500, min_deal_score=min_score)
+        df = repo.get_top_deals(limit=max(limit, 5000), min_deal_score=min_score)
         if df is None or df.empty:
             return jsonify([])
 

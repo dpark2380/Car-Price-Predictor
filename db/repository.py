@@ -14,7 +14,7 @@ from loguru import logger
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
-from db.models import CarListing, Prediction, PopularitySnapshot
+from db.models import CarListing, Prediction, PopularitySnapshot, SalesStatsCache
 
 
 # ── Listings ──────────────────────────────────────────────────────────────────
@@ -222,6 +222,9 @@ class PopularityRepository:
         self.session.commit()
         logger.info(f"Saved popularity snapshot: {len(snapshots)} cohorts")
 
+    def get_latest_snapshot_date(self):
+        return self.session.query(func.max(PopularitySnapshot.snapshot_date)).scalar()
+
     def get_trending(self, top_n: int = 10) -> pd.DataFrame:
         """Return the currently most popular make/model combinations."""
         latest = self.session.query(func.max(PopularitySnapshot.snapshot_date)).scalar()
@@ -241,3 +244,71 @@ class PopularityRepository:
             for r in results
         ]
         return pd.DataFrame(rows)
+
+
+# ── Sales Stats Cache ──────────────────────────────────────────────────────────
+
+class SalesStatsCacheRepository:
+    CACHE_TTL_DAYS = 30
+
+    def __init__(self, session: Session):
+        self.session = session
+
+    def get(self, make: str, state: str) -> SalesStatsCache | None:
+        """Return cached entry if it exists and is less than 30 days old."""
+        cutoff = datetime.utcnow() - timedelta(days=self.CACHE_TTL_DAYS)
+        return (
+            self.session.query(SalesStatsCache)
+            .filter(
+                SalesStatsCache.make == make.lower(),
+                SalesStatsCache.state == state.upper(),
+                SalesStatsCache.fetched_at >= cutoff,
+            )
+            .first()
+        )
+
+    def upsert(self, make: str, state: str, data: dict) -> None:
+        """Insert or update a cache entry."""
+        make = make.lower()
+        state = state.upper()
+        existing = (
+            self.session.query(SalesStatsCache)
+            .filter_by(make=make, state=state)
+            .first()
+        )
+        if existing:
+            existing.median_price       = data.get("median_price")
+            existing.trimmed_mean_price = data.get("trimmed_mean_price")
+            existing.median_dom         = data.get("median_dom")
+            existing.sample_count       = data.get("sample_count")
+            existing.fetched_at         = datetime.utcnow()
+        else:
+            self.session.add(SalesStatsCache(
+                make=make,
+                state=state,
+                median_price=data.get("median_price"),
+                trimmed_mean_price=data.get("trimmed_mean_price"),
+                median_dom=data.get("median_dom"),
+                sample_count=data.get("sample_count"),
+                fetched_at=datetime.utcnow(),
+            ))
+        self.session.commit()
+
+    def get_all_as_dict(self) -> dict:
+        """Return all non-expired entries as {(make, model): {...}} for fast DataFrame joins.
+        Note: the 'state' column stores the model name for (make, model) level cache entries."""
+        cutoff = datetime.utcnow() - timedelta(days=self.CACHE_TTL_DAYS)
+        rows = (
+            self.session.query(SalesStatsCache)
+            .filter(SalesStatsCache.fetched_at >= cutoff)
+            .all()
+        )
+        return {
+            (r.make, r.state): {
+                "market_median_price":       r.median_price,
+                "market_trimmed_mean_price": r.trimmed_mean_price,
+                "market_dom_median":         r.median_dom,
+                "market_sample_count":       r.sample_count,
+            }
+            for r in rows
+        }
