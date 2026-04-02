@@ -1,24 +1,18 @@
 import React from "react";
-import { getDealColor } from "../../utils/scoreColor";
+import { getDealColor, starsDisplay } from "../../utils/scoreColor";
 
-export default function DealBadge({ label, score }) {
+export default function DealBadge({ score }) {
   const color = getDealColor(score);
   return (
     <span
       style={{
-        background: color + "22",
         color,
-        border: `1px solid ${color}44`,
-        borderRadius: 3,
-        fontSize: 10,
-        fontFamily: "'JetBrains Mono', monospace",
-        padding: "2px 6px",
+        fontSize: 15,
         letterSpacing: "0.05em",
-        textTransform: "uppercase",
-        whiteSpace: "nowrap",
+        fontFamily: "inherit",
       }}
     >
-      {label}
+      {starsDisplay(score)}
     </span>
   );
 }

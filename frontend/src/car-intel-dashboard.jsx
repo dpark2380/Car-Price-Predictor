@@ -1,15 +1,61 @@
 import { useState, useEffect, useMemo } from "react";
 import { fmt$, fmtN, normalizeBodyType } from "./utils/format";
-import { getDealColor } from "./utils/scoreColor.js";
+import { getDealColor, scoreToStars, starsDisplay } from "./utils/scoreColor.js";
 import Spinner from "./components/common/Spinner";
 import DealBadge from "./components/deals/DealBadge";
 
+
 const API = "http://localhost:5001/api";
 
+// Body types that support Small/Medium/Large sub-filtering (matched lowercase)
+const SIZE_SUPPORTED = new Set(["suv", "truck", "sedan", "hatchback"]);
+
+// Approximate size bands by predicted price (proxy for vehicle size within a category)
+const SIZE_PRICE_BANDS = {
+  Small:  { max: 22000 },
+  Medium: { min: 18000, max: 40000 },
+  Large:  { min: 35000 },
+};
+
+function FilterSelect({ label, value, onChange, children, minWidth = 120, disabled = false }) {
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 4, opacity: disabled ? 0.45 : 1 }}>
+      <span style={{ fontFamily: "monospace", fontSize: 9, color: "#64748b", letterSpacing: "0.1em" }}>{label}</span>
+      <select
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        disabled={disabled}
+        style={{
+          background: "#f1f5f9",
+          border: "1px solid #e2e8f0",
+          borderRadius: 4,
+          color: value ? "#0f172a" : "#64748b",
+          fontFamily: "monospace",
+          fontSize: 12,
+          outline: "none",
+          cursor: disabled ? "not-allowed" : "pointer",
+          padding: "6px 8px",
+          minWidth,
+        }}
+      >
+        {children}
+      </select>
+    </div>
+  );
+}
+
 export default function CarIntelDashboard() {
-  const [searchQuery, setSearchQuery] = useState("");
-  const [minScore, setMinScore] = useState(0);
+  const [view, setView] = useState("home"); // "home" | "results"
+
+  const [makeFilter, setMakeFilter] = useState("");
+  const [modelFilter, setModelFilter] = useState("");
+  const [sizeFilter, setSizeFilter] = useState("");
   const [bodyFilter, setBodyFilter] = useState("");
+  const [minYear, setMinYear] = useState("");
+  const [maxYear, setMaxYear] = useState("");
+  const [minMileage, setMinMileage] = useState("");
+  const [maxMileage, setMaxMileage] = useState("");
+  const [minStars, setMinStars] = useState(1);
 
   const [selectedDeal, setSelectedDeal] = useState(null);
   const [tickerIdx, setTickerIdx] = useState(0);
@@ -42,19 +88,37 @@ export default function CarIntelDashboard() {
       }
     };
 
-    load("deals", `${API}/deals?limit=500&min_score=0`, setDeals);
+    load("deals", `${API}/deals?limit=5000&min_score=0`, setDeals);
     load("stats", `${API}/stats`, setStats);
   }, []);
+
+  const makeOptions = useMemo(() => {
+    const set = new Set();
+    (deals || []).forEach((d) => { if (d.make) set.add(d.make.toLowerCase()); });
+    return Array.from(set).sort((a, b) => a.localeCompare(b));
+  }, [deals]);
+
+  const modelOptions = useMemo(() => {
+    if (!makeFilter) return [];
+    const set = new Set();
+    (deals || [])
+      .filter((d) => d.make?.toLowerCase() === makeFilter)
+      .forEach((d) => { if (d.model) set.add(d.model.toLowerCase()); });
+    return Array.from(set).sort((a, b) => a.localeCompare(b));
+  }, [deals, makeFilter]);
+
+  const yearOptions = useMemo(() => {
+    const set = new Set();
+    (deals || []).forEach((d) => { if (d.year) set.add(d.year); });
+    return Array.from(set).sort((a, b) => a - b);
+  }, [deals]);
 
   const bodyOptions = useMemo(() => {
     const set = new Set();
     (deals || []).forEach((d) => set.add(normalizeBodyType(d.body_type)));
     const opts = Array.from(set).sort((a, b) => a.localeCompare(b));
     const unknownIdx = opts.indexOf("Unknown");
-    if (unknownIdx >= 0) {
-      opts.splice(unknownIdx, 1);
-      opts.push("Unknown");
-    }
+    if (unknownIdx >= 0) { opts.splice(unknownIdx, 1); opts.push("Unknown"); }
     return opts;
   }, [deals]);
 
@@ -74,18 +138,23 @@ export default function CarIntelDashboard() {
   const filteredDeals = useMemo(() => {
     const arr = (deals || [])
       .filter((d) => d.deal_score != null)
-      .filter((d) => (d.deal_score ?? 0) >= minScore)
-      .filter(
-        (d) =>
-          !searchQuery ||
-          d.make?.toLowerCase().includes(searchQuery.toLowerCase()) ||
-          d.model?.toLowerCase().includes(searchQuery.toLowerCase())
-      )
+      .filter((d) => scoreToStars(d.deal_score) >= minStars)
+      .filter((d) => !makeFilter || d.make?.toLowerCase() === makeFilter)
+      .filter((d) => !modelFilter || d.model?.toLowerCase() === modelFilter)
+      .filter((d) => !bodyFilter || normalizeBodyType(d.body_type).toLowerCase() === bodyFilter.toLowerCase())
       .filter((d) => {
-        if (!bodyFilter) return true;
-        const bt = normalizeBodyType(d.body_type);
-        return bt.toLowerCase() === bodyFilter.toLowerCase();
-      });
+        if (!sizeFilter) return true;
+        const band = SIZE_PRICE_BANDS[sizeFilter];
+        if (!band) return true;
+        const p = d.predicted_price ?? d.price;
+        if (band.min && p < band.min) return false;
+        if (band.max && p > band.max) return false;
+        return true;
+      })
+      .filter((d) => !minYear || d.year >= Number(minYear))
+      .filter((d) => !maxYear || d.year <= Number(maxYear))
+      .filter((d) => !minMileage || d.mileage >= Number(minMileage))
+      .filter((d) => !maxMileage || d.mileage <= Number(maxMileage));
 
     const num = (v) => {
       const n = Number(v);
@@ -97,6 +166,7 @@ export default function CarIntelDashboard() {
       if (sortKey === "price") return num(d.price);
       if (sortKey === "savings") return num(d.savings);
       if (sortKey === "mileage") return num(d.mileage);
+      if (sortKey === "year") return num(d.year);
       return num(d.deal_score);
     };
 
@@ -113,7 +183,7 @@ export default function CarIntelDashboard() {
     });
 
     return arr;
-  }, [deals, searchQuery, minScore, bodyFilter, sortKey, sortDir]);
+  }, [deals, minStars, makeFilter, modelFilter, sizeFilter, bodyFilter, minYear, maxYear, minMileage, maxMileage, sortKey, sortDir]);
 
   const currentTicker = topTickerDeals[tickerIdx] || {};
   const isLoading = Object.values(loading).some(Boolean);
@@ -129,31 +199,166 @@ export default function CarIntelDashboard() {
     setSalesLoading(false);
   };
 
-  return (
-    <div style={{ minHeight: "100vh", background: "#080e14", color: "#e2e8f0", fontFamily: "'DM Sans', sans-serif", position: "relative" }}>
-      <style>{`
-        @import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@300;400;500;600&family=JetBrains+Mono:wght@400;500;700&family=Bebas+Neue&display=swap');
-        * { box-sizing: border-box; margin: 0; padding: 0; }
-        ::-webkit-scrollbar { width: 4px; background: #0f1923; }
-        ::-webkit-scrollbar-thumb { background: #1e3a4a; border-radius: 2px; }
-        .deal-row { transition: background 0.15s; cursor: pointer; }
-        .deal-row:hover { background: #0f1923 !important; }
-        @keyframes pulse { 0%,100% { opacity:1; } 50% { opacity:0.3; } }
-        @keyframes fadeUp { from { opacity:0; transform:translateY(12px); } to { opacity:1; transform:translateY(0); } }
-        @keyframes slideIn { from { transform:translateY(8px); opacity:0; } to { transform:translateY(0); opacity:1; } }
-      `}</style>
+  const sharedStyles = `
+    @import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@300;400;500;600&family=JetBrains+Mono:wght@400;500;700&family=Bebas+Neue&display=swap');
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    ::-webkit-scrollbar { width: 4px; background: #f1f5f9; }
+    ::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 2px; }
+    .deal-row { transition: background 0.15s; cursor: pointer; }
+    .deal-row:hover { background: #f1f5f9 !important; }
+    @keyframes pulse { 0%,100% { opacity:1; } 50% { opacity:0.3; } }
+    @keyframes fadeUp { from { opacity:0; transform:translateY(12px); } to { opacity:1; transform:translateY(0); } }
+    @keyframes slideIn { from { transform:translateY(8px); opacity:0; } to { transform:translateY(0); opacity:1; } }
+    .home-search-btn { transition: background 0.15s, transform 0.1s; }
+    .home-search-btn:hover { background: #1d4ed8 !important; transform: translateY(-1px); }
+    .home-search-btn:active { transform: translateY(0); }
+    select option { color: #0f172a; background: #ffffff; }
+  `;
 
-      <div
-        style={{
-          position: "fixed",
-          inset: 0,
-          pointerEvents: "none",
-          backgroundImage:
-            "linear-gradient(#1e3a4a11 1px,transparent 1px),linear-gradient(90deg,#1e3a4a11 1px,transparent 1px)",
-          backgroundSize: "40px 40px",
-          zIndex: 0,
-        }}
-      />
+  const gridBg = (
+    <div style={{ position: "fixed", inset: 0, pointerEvents: "none",
+      backgroundImage: "linear-gradient(#94a3b818 1px,transparent 1px),linear-gradient(90deg,#94a3b818 1px,transparent 1px)",
+      backgroundSize: "40px 40px", zIndex: 0 }} />
+  );
+
+  // ── HOME PAGE ────────────────────────────────────────────────────────────────
+  if (view === "home") {
+    return (
+      <div style={{ minHeight: "100vh", background: "#f8fafc", color: "#0f172a", fontFamily: "'DM Sans', sans-serif", position: "relative", display: "flex", flexDirection: "column" }}>
+        <style>{sharedStyles}</style>
+        {gridBg}
+
+        {/* Nav bar */}
+        <header style={{ position: "relative", zIndex: 10, borderBottom: "1px solid #e2e8f0", background: "#f8fafcee", backdropFilter: "blur(12px)", padding: "0 40px", display: "flex", alignItems: "center", justifyContent: "space-between", height: 60 }}>
+          <div style={{ fontFamily: "'Bebas Neue',sans-serif", fontSize: 28, letterSpacing: "0.1em", color: "#2563eb" }}>CARINTEL</div>
+          <div style={{ display: "flex", gap: 24 }}>
+            {[
+              { label: "LISTINGS", value: isLoading ? "—" : fmtN(stats.active_listings) },
+              { label: "MAKES",    value: isLoading ? "—" : stats.makes },
+              { label: "AVG PRICE",value: isLoading ? "—" : fmt$(stats.avg_price) },
+            ].map((s) => (
+              <div key={s.label} style={{ textAlign: "right" }}>
+                <div style={{ fontFamily: "monospace", fontSize: 9, color: "#475569", letterSpacing: "0.1em" }}>{s.label}</div>
+                <div style={{ fontFamily: "'JetBrains Mono',monospace", fontSize: 13, color: "#0f172a", fontWeight: 700 }}>{s.value}</div>
+              </div>
+            ))}
+          </div>
+        </header>
+
+        {/* Hero */}
+        <div style={{ flex: 1, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", padding: "60px 32px", position: "relative", zIndex: 1, animation: "fadeUp 0.4s ease" }}>
+          <div style={{ fontFamily: "'Bebas Neue',sans-serif", fontSize: 72, letterSpacing: "0.08em", color: "#0f172a", lineHeight: 1, textAlign: "center" }}>
+            FIND YOUR NEXT <span style={{ color: "#2563eb" }}>DEAL</span>
+          </div>
+          <div style={{ fontFamily: "monospace", fontSize: 13, color: "#64748b", marginTop: 12, letterSpacing: "0.05em", textAlign: "center" }}>
+            ML-powered used car pricing · {isLoading ? "..." : fmtN(stats.active_listings)} active listings
+          </div>
+
+          {/* Search card */}
+          <div style={{ marginTop: 48, background: "#ffffff", border: "1px solid #e2e8f0", borderRadius: 10, padding: "32px 36px", boxShadow: "0 4px 24px #0f172a0a", width: "100%", maxWidth: 920 }}>
+            <div style={{ fontFamily: "monospace", fontSize: 10, color: "#94a3b8", letterSpacing: "0.12em", marginBottom: 20 }}>SEARCH FILTERS</div>
+
+            {/* Filter row */}
+            <div style={{ display: "flex", gap: 12, flexWrap: "wrap", alignItems: "flex-end" }}>
+              <FilterSelect label="MAKE" value={makeFilter} onChange={(v) => { setMakeFilter(v); setModelFilter(""); }} minWidth={140}>
+                <option value="">Any Make</option>
+                {makeOptions.map((m) => <option key={m} value={m}>{m.charAt(0).toUpperCase() + m.slice(1)}</option>)}
+              </FilterSelect>
+
+              <FilterSelect label="MODEL" value={modelFilter} onChange={setModelFilter} disabled={!makeFilter} minWidth={140}>
+                <option value="">Any Model</option>
+                {modelOptions.map((m) => <option key={m} value={m}>{m.charAt(0).toUpperCase() + m.slice(1)}</option>)}
+              </FilterSelect>
+
+              <FilterSelect label="BODY TYPE" value={bodyFilter} onChange={(v) => { setBodyFilter(v); if (!SIZE_SUPPORTED.has(v.toLowerCase())) setSizeFilter(""); }} minWidth={130}>
+                <option value="">Any Body</option>
+                {bodyOptions.map((bt) => <option key={bt} value={bt}>{bt}</option>)}
+              </FilterSelect>
+
+              {SIZE_SUPPORTED.has(bodyFilter.toLowerCase()) && (
+                <FilterSelect label="SIZE" value={sizeFilter} onChange={setSizeFilter} minWidth={110}>
+                  <option value="">Any Size</option>
+                  <option value="Small">Small</option>
+                  <option value="Medium">Medium</option>
+                  <option value="Large">Large</option>
+                </FilterSelect>
+              )}
+
+              <div style={{ display: "flex", gap: 4, alignItems: "flex-end" }}>
+                <FilterSelect label="YEAR FROM" value={minYear} onChange={setMinYear} minWidth={95}>
+                  <option value="">Any</option>
+                  {yearOptions.map((y) => <option key={y} value={y}>{y}</option>)}
+                </FilterSelect>
+                <span style={{ fontFamily: "monospace", fontSize: 11, color: "#94a3b8", paddingBottom: 9 }}>–</span>
+                <FilterSelect label="YEAR TO" value={maxYear} onChange={setMaxYear} minWidth={95}>
+                  <option value="">Any</option>
+                  {[...yearOptions].reverse().map((y) => <option key={y} value={y}>{y}</option>)}
+                </FilterSelect>
+              </div>
+
+              <div style={{ display: "flex", gap: 4, alignItems: "flex-end" }}>
+                <FilterSelect label="MIN MILEAGE" value={minMileage} onChange={setMinMileage} minWidth={110}>
+                  <option value="">Any</option>
+                  {[10000, 25000, 50000, 75000, 100000, 125000, 150000].map((m) => <option key={m} value={m}>{(m/1000).toFixed(0)}k mi</option>)}
+                </FilterSelect>
+                <span style={{ fontFamily: "monospace", fontSize: 11, color: "#94a3b8", paddingBottom: 9 }}>–</span>
+                <FilterSelect label="MAX MILEAGE" value={maxMileage} onChange={setMaxMileage} minWidth={110}>
+                  <option value="">Any</option>
+                  {[25000, 50000, 75000, 100000, 125000, 150000, 200000].map((m) => <option key={m} value={m}>{(m/1000).toFixed(0)}k mi</option>)}
+                </FilterSelect>
+              </div>
+            </div>
+
+            {/* Search button */}
+            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginTop: 24 }}>
+              <div style={{ fontFamily: "monospace", fontSize: 11, color: "#94a3b8" }}>
+                {filteredDeals.length > 0 ? `${filteredDeals.length} listings match` : ""}
+              </div>
+              <button
+                className="home-search-btn"
+                onClick={() => setView("results")}
+                style={{ background: "#2563eb", color: "#ffffff", border: "none", borderRadius: 6, padding: "12px 32px", fontFamily: "monospace", fontSize: 13, fontWeight: 700, letterSpacing: "0.08em", cursor: "pointer" }}
+              >
+                SEARCH DEALS →
+              </button>
+            </div>
+          </div>
+
+          {/* Quick links */}
+          <div style={{ display: "flex", gap: 12, marginTop: 24, flexWrap: "wrap", justifyContent: "center" }}>
+            {[
+              { label: "Trucks", action: () => { setBodyFilter("Truck"); setView("results"); } },
+              { label: "SUVs",   action: () => { setBodyFilter("SUV");   setView("results"); } },
+              { label: "Sedans", action: () => { setBodyFilter("Sedan"); setView("results"); } },
+              { label: "Best Deals", action: () => { setMinStars(4); setView("results"); } },
+              { label: "Low Mileage", action: () => { setMaxMileage("50000"); setView("results"); } },
+            ].map(({ label, action }) => (
+              <button key={label} onClick={action}
+                style={{ background: "none", border: "1px solid #e2e8f0", color: "#475569", borderRadius: 20, padding: "6px 16px", fontFamily: "monospace", fontSize: 11, cursor: "pointer", transition: "border-color 0.15s, color 0.15s" }}
+                onMouseEnter={(e) => { e.currentTarget.style.borderColor = "#2563eb"; e.currentTarget.style.color = "#2563eb"; }}
+                onMouseLeave={(e) => { e.currentTarget.style.borderColor = "#e2e8f0"; e.currentTarget.style.color = "#475569"; }}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+        </div>
+
+        <footer style={{ position: "relative", zIndex: 1, borderTop: "1px solid #e2e8f0", padding: "14px 40px", display: "flex", justifyContent: "space-between" }}>
+          <div style={{ fontFamily: "monospace", fontSize: 10, color: "#cbd5e1" }}>CARINTEL — XGBOOST PRICE MODEL</div>
+          <div style={{ fontFamily: "monospace", fontSize: 10, color: "#cbd5e1" }}>
+            {stats.last_updated ? `LAST UPDATED: ${new Date(stats.last_updated).toLocaleTimeString()}` : ""}
+          </div>
+        </footer>
+      </div>
+    );
+  }
+
+  // ── RESULTS PAGE ─────────────────────────────────────────────────────────────
+  return (
+    <div style={{ minHeight: "100vh", background: "#f8fafc", color: "#0f172a", fontFamily: "'DM Sans', sans-serif", position: "relative" }}>
+      <style>{sharedStyles}</style>
+      {gridBg}
 
       {apiError && (
         <div
@@ -178,8 +383,8 @@ export default function CarIntelDashboard() {
         style={{
           position: "relative",
           zIndex: 10,
-          borderBottom: "1px solid #1e3a4a",
-          background: "#080e14ee",
+          borderBottom: "1px solid #e2e8f0",
+          background: "#f8fafcee",
           backdropFilter: "blur(12px)",
           padding: "0 32px",
           display: "flex",
@@ -189,19 +394,19 @@ export default function CarIntelDashboard() {
         }}
       >
         <div style={{ display: "flex", alignItems: "center", gap: 16 }}>
-          <div style={{ fontFamily: "'Bebas Neue',sans-serif", fontSize: 28, letterSpacing: "0.1em", color: "#ff6b2b", lineHeight: 1 }}>
+          <button onClick={() => { setView("home"); setMakeFilter(""); setModelFilter(""); setSizeFilter(""); setBodyFilter(""); setMinYear(""); setMaxYear(""); setMinMileage(""); setMaxMileage(""); setMinStars(1); }} style={{ background: "none", border: "none", cursor: "pointer", fontFamily: "'Bebas Neue',sans-serif", fontSize: 28, letterSpacing: "0.1em", color: "#2563eb", lineHeight: 1, padding: 0 }}>
             CARINTEL
-          </div>
-          <div style={{ width: 1, height: 24, background: "#1e3a4a" }} />
+          </button>
+          <div style={{ width: 1, height: 24, background: "#e2e8f0" }} />
           <div style={{ fontFamily: "monospace", fontSize: 11, color: "#475569", letterSpacing: "0.1em" }}>DEAL FINDER</div>
         </div>
 
         {currentTicker.make && (
-          <div style={{ display: "flex", alignItems: "center", gap: 10, background: "#0f1923", border: "1px solid #1e3a4a", borderRadius: 4, padding: "6px 14px" }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 10, background: "#f1f5f9", border: "1px solid #e2e8f0", borderRadius: 4, padding: "6px 14px" }}>
             <div style={{ width: 6, height: 6, borderRadius: "50%", background: "#22c55e", animation: "pulse 2s infinite" }} />
             <span style={{ fontFamily: "monospace", fontSize: 11, color: "#64748b" }}>BEST DEAL:</span>
-            <span style={{ fontFamily: "monospace", fontSize: 11, color: "#e2e8f0" }}>{currentTicker.year} {currentTicker.make} {currentTicker.model}</span>
-            <span style={{ fontFamily: "monospace", fontSize: 11, color: "#ff6b2b", fontWeight: 700 }}>{fmt$(currentTicker.price)}</span>
+            <span style={{ fontFamily: "monospace", fontSize: 11, color: "#0f172a" }}>{currentTicker.year} {currentTicker.make} {currentTicker.model}</span>
+            <span style={{ fontFamily: "monospace", fontSize: 11, color: "#2563eb", fontWeight: 700 }}>{fmt$(currentTicker.price)}</span>
             {currentTicker.savings > 0 && (
               <span style={{ fontFamily: "monospace", fontSize: 10, color: "#22c55e" }}>↓{fmt$(currentTicker.savings)} below market</span>
             )}
@@ -216,7 +421,7 @@ export default function CarIntelDashboard() {
           ].map((s) => (
             <div key={s.label} style={{ textAlign: "right" }}>
               <div style={{ fontFamily: "monospace", fontSize: 9, color: "#475569", letterSpacing: "0.1em" }}>{s.label}</div>
-              <div style={{ fontFamily: "'JetBrains Mono',monospace", fontSize: 13, color: "#e2e8f0", fontWeight: 700 }}>{s.value}</div>
+              <div style={{ fontFamily: "'JetBrains Mono',monospace", fontSize: 13, color: "#0f172a", fontWeight: 700 }}>{s.value}</div>
             </div>
           ))}
         </div>
@@ -224,114 +429,137 @@ export default function CarIntelDashboard() {
 
       <main style={{ position: "relative", zIndex: 1, padding: "28px 32px", maxWidth: 1400, margin: "0 auto" }}>
         <div style={{ animation: "fadeUp 0.3s ease" }}>
-          <div style={{ display: "flex", gap: 16, marginBottom: 24, alignItems: "center" }}>
-            <div style={{ flex: 1, position: "relative" }}>
-              <input
-                value={searchQuery}
-                onChange={(e) => setSearchQuery(e.target.value)}
-                placeholder="Filter by make or model..."
-                style={{
-                  width: "100%",
-                  background: "#0f1923",
-                  border: "1px solid #1e3a4a",
-                  borderRadius: 4,
-                  color: "#e2e8f0",
-                  padding: "9px 14px 9px 36px",
-                  fontFamily: "monospace",
-                  fontSize: 12,
-                  outline: "none",
-                }}
-              />
-              <span style={{ position: "absolute", left: 12, top: "50%", transform: "translateY(-50%)", color: "#475569", fontSize: 14 }}>⌕</span>
-            </div>
-
-            <div style={{ display: "flex", alignItems: "center", gap: 10, background: "#0f1923", border: "1px solid #1e3a4a", borderRadius: 4, padding: "9px 12px" }}>
-              <span style={{ fontFamily: "monospace", fontSize: 11, color: "#64748b" }}>BODY</span>
-              <select
-                value={bodyFilter}
-                onChange={(e) => setBodyFilter(e.target.value)}
-                style={{
-                  background: "transparent",
-                  border: "none",
-                  color: "#e2e8f0",
-                  fontFamily: "monospace",
-                  fontSize: 12,
-                  outline: "none",
-                  minWidth: 140,
-                  cursor: "pointer",
-                }}
+          {/* Filter bar */}
+          <div style={{ marginBottom: 16, background: "#ffffff", border: "1px solid #e2e8f0", borderRadius: 6, padding: "14px 16px" }}>
+            {/* Row 1: main filters */}
+            <div style={{ display: "flex", gap: 10, flexWrap: "wrap", alignItems: "flex-end" }}>
+              {/* Make */}
+              <FilterSelect
+                label="MAKE"
+                value={makeFilter}
+                onChange={(v) => { setMakeFilter(v); setModelFilter(""); }}
+                minWidth={130}
               >
-                <option value="">All</option>
+                <option value="">Any Make</option>
+                {makeOptions.map((m) => (
+                  <option key={m} value={m}>{m.charAt(0).toUpperCase() + m.slice(1)}</option>
+                ))}
+              </FilterSelect>
+
+              {/* Model — only active when make is chosen */}
+              <FilterSelect
+                label="MODEL"
+                value={modelFilter}
+                onChange={setModelFilter}
+                disabled={!makeFilter}
+                minWidth={130}
+              >
+                <option value="">Any Model</option>
+                {modelOptions.map((m) => (
+                  <option key={m} value={m}>{m.charAt(0).toUpperCase() + m.slice(1)}</option>
+                ))}
+              </FilterSelect>
+
+              {/* Body type → Size cascade */}
+              <FilterSelect label="BODY TYPE" value={bodyFilter} onChange={(v) => { setBodyFilter(v); if (!SIZE_SUPPORTED.has(v.toLowerCase())) setSizeFilter(""); }} minWidth={120}>
+                <option value="">Any Body</option>
                 {bodyOptions.map((bt) => (
                   <option key={bt} value={bt}>{bt}</option>
                 ))}
-              </select>
+              </FilterSelect>
+
+              {SIZE_SUPPORTED.has(bodyFilter.toLowerCase()) && (
+                <FilterSelect label="SIZE" value={sizeFilter} onChange={setSizeFilter} minWidth={110}>
+                  <option value="">Any Size</option>
+                  <option value="Small">Small</option>
+                  <option value="Medium">Medium</option>
+                  <option value="Large">Large</option>
+                </FilterSelect>
+              )}
+
+              {/* Year range */}
+              <div style={{ display: "flex", gap: 4, alignItems: "flex-end" }}>
+                <FilterSelect label="YEAR FROM" value={minYear} onChange={setMinYear} minWidth={90}>
+                  <option value="">Any</option>
+                  {yearOptions.map((y) => (
+                    <option key={y} value={y}>{y}</option>
+                  ))}
+                </FilterSelect>
+                <span style={{ fontFamily: "monospace", fontSize: 11, color: "#94a3b8", paddingBottom: 9 }}>–</span>
+                <FilterSelect label="YEAR TO" value={maxYear} onChange={setMaxYear} minWidth={90}>
+                  <option value="">Any</option>
+                  {[...yearOptions].reverse().map((y) => (
+                    <option key={y} value={y}>{y}</option>
+                  ))}
+                </FilterSelect>
+              </div>
+
+              {/* Mileage range */}
+              <div style={{ display: "flex", gap: 4, alignItems: "flex-end" }}>
+                <FilterSelect label="MIN MILEAGE" value={minMileage} onChange={setMinMileage} minWidth={110}>
+                  <option value="">Any</option>
+                  {[10000, 25000, 50000, 75000, 100000, 125000, 150000].map((m) => (
+                    <option key={m} value={m}>{(m / 1000).toFixed(0)}k mi</option>
+                  ))}
+                </FilterSelect>
+                <span style={{ fontFamily: "monospace", fontSize: 11, color: "#94a3b8", paddingBottom: 9 }}>–</span>
+                <FilterSelect label="MAX MILEAGE" value={maxMileage} onChange={setMaxMileage} minWidth={110}>
+                  <option value="">Any</option>
+                  {[25000, 50000, 75000, 100000, 125000, 150000, 200000].map((m) => (
+                    <option key={m} value={m}>{(m / 1000).toFixed(0)}k mi</option>
+                  ))}
+                </FilterSelect>
+              </div>
+
+              {/* Spacer */}
+              <div style={{ flex: 1 }} />
+
+              {/* Clear filters */}
+              {(makeFilter || modelFilter || sizeFilter || bodyFilter || minYear || maxYear || minMileage || maxMileage || minStars > 1) && (
+                <button
+                  onClick={() => { setMakeFilter(""); setModelFilter(""); setSizeFilter(""); setBodyFilter(""); setMinYear(""); setMaxYear(""); setMinMileage(""); setMaxMileage(""); setMinStars(1); }}
+                  style={{ background: "none", border: "1px solid #e2e8f0", color: "#64748b", borderRadius: 4, padding: "6px 12px", cursor: "pointer", fontFamily: "monospace", fontSize: 11, alignSelf: "flex-end" }}
+                >
+                  CLEAR ✕
+                </button>
+              )}
             </div>
 
-            <div
-              style={{
-                display: "flex",
-                alignItems: "center",
-                gap: 10,
-                background: "#0f1923",
-                border: "1px solid #1e3a4a",
-                borderRadius: 4,
-                padding: "9px 12px",
-              }}
-            >
-              <span style={{ fontFamily: "monospace", fontSize: 11, color: "#64748b" }}>SORT BY</span>
+            {/* Row 2: score + sort + count */}
+            <div style={{ display: "flex", gap: 10, alignItems: "center", marginTop: 12, paddingTop: 12, borderTop: "1px solid #f1f5f9", flexWrap: "wrap" }}>
+              <span style={{ fontFamily: "monospace", fontSize: 11, color: "#64748b" }}>MIN SCORE</span>
+              <input type="range" min={1} max={5} step={1} value={minStars} onChange={(e) => setMinStars(+e.target.value)} style={{ accentColor: "#2563eb", width: 80 }} />
+              <span style={{ fontSize: 13, color: "#2563eb", minWidth: 60 }}>{"★".repeat(minStars) + "☆".repeat(5 - minStars)}</span>
 
+              <div style={{ width: 1, height: 16, background: "#e2e8f0", margin: "0 4px" }} />
+
+              <span style={{ fontFamily: "monospace", fontSize: 11, color: "#64748b" }}>SORT</span>
               <select
                 value={sortKey}
                 onChange={(e) => setSortKey(e.target.value)}
-                style={{
-                  background: "transparent",
-                  border: "none",
-                  color: "#e2e8f0",
-                  fontFamily: "monospace",
-                  fontSize: 12,
-                  outline: "none",
-                  cursor: "pointer",
-                  minWidth: 110,
-                }}
+                style={{ background: "transparent", border: "1px solid #e2e8f0", borderRadius: 4, color: "#0f172a", fontFamily: "monospace", fontSize: 11, outline: "none", cursor: "pointer", padding: "4px 8px" }}
               >
                 <option value="score">Score</option>
                 <option value="price">Price</option>
                 <option value="savings">Savings</option>
                 <option value="mileage">Mileage</option>
+                <option value="year">Year</option>
               </select>
-
               <button
                 onClick={() => setSortDir((d) => (d === "asc" ? "desc" : "asc"))}
-                title={sortDir === "asc" ? "Ascending" : "Descending"}
-                style={{
-                  background: "none",
-                  border: "1px solid #1e3a4a",
-                  color: "#e2e8f0",
-                  borderRadius: 4,
-                  padding: "2px 8px",
-                  cursor: "pointer",
-                  fontFamily: "monospace",
-                  fontSize: 12,
-                  lineHeight: "18px",
-                }}
+                style={{ background: "none", border: "1px solid #e2e8f0", color: "#0f172a", borderRadius: 4, padding: "4px 8px", cursor: "pointer", fontFamily: "monospace", fontSize: 12 }}
               >
-                {sortDir === "asc" ? "↑" : "↓"}
+                {sortDir === "asc" ? "↑ ASC" : "↓ DESC"}
               </button>
-            </div>
 
-            <div style={{ display: "flex", alignItems: "center", gap: 12, background: "#0f1923", border: "1px solid #1e3a4a", borderRadius: 4, padding: "9px 16px" }}>
-              <span style={{ fontFamily: "monospace", fontSize: 11, color: "#64748b" }}>MIN SCORE</span>
-              <input type="range" min={0} max={100} value={minScore} onChange={(e) => setMinScore(+e.target.value)} style={{ accentColor: "#ff6b2b", width: 110 }} />
-              <span style={{ fontFamily: "'JetBrains Mono',monospace", fontSize: 13, color: "#ff6b2b", fontWeight: 700, minWidth: 28 }}>{minScore}</span>
+              <div style={{ flex: 1 }} />
+              <div style={{ fontFamily: "monospace", fontSize: 11, color: "#475569" }}>{filteredDeals.length} RESULTS</div>
             </div>
-
-            <div style={{ fontFamily: "monospace", fontSize: 11, color: "#475569" }}>{filteredDeals.length} RESULTS</div>
           </div>
 
-          <div style={{ background: "#0a1218", border: "1px solid #1e3a4a", borderRadius: 6, overflow: "hidden" }}>
-            <div style={{ display: "grid", gridTemplateColumns: "44px 1fr 90px 110px 110px 100px 80px 90px", padding: "10px 20px", borderBottom: "1px solid #1e3a4a", background: "#0f1923" }}>
-              {["SCORE", "VEHICLE", "PRICE", "MARKET VALUE", "SAVINGS", "MILEAGE", "STATE", "DEAL"].map((h) => (
+          <div style={{ background: "#ffffff", border: "1px solid #e2e8f0", borderRadius: 6, overflow: "hidden" }}>
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 90px 110px 110px 100px 80px 110px", padding: "10px 20px", borderBottom: "1px solid #e2e8f0", background: "#f1f5f9" }}>
+              {["VEHICLE", "PRICE", "MARKET VALUE", "SAVINGS", "MILEAGE", "STATE", "SCORE"].map((h) => (
                 <div key={h} style={{ fontFamily: "monospace", fontSize: 9, color: "#475569", letterSpacing: "0.1em" }}>{h}</div>
               ))}
             </div>
@@ -344,23 +572,19 @@ export default function CarIntelDashboard() {
               </div>
             ) : (
               filteredDeals.map((deal, i) => (
+                <div key={i}>
                 <div
-                  key={i}
                   className="deal-row"
                   onClick={() => handleSelectDeal(deal)}
                   style={{
                     display: "grid",
-                    gridTemplateColumns: "44px 1fr 90px 110px 110px 100px 80px 90px",
+                    gridTemplateColumns: "1fr 90px 110px 110px 100px 80px 110px",
                     padding: "13px 20px",
-                    borderBottom: "1px solid #0f1923",
-                    background: selectedDeal?.listing_id === deal.listing_id ? "#0f1923" : "transparent",
+                    borderBottom: selectedDeal?.listing_id === deal.listing_id ? "none" : "1px solid #f1f5f9",
+                    background: selectedDeal?.listing_id === deal.listing_id ? "#f1f5f9" : "transparent",
                     alignItems: "center",
                   }}
                 >
-                  <div style={{ fontFamily: "'JetBrains Mono',monospace", fontSize: 13, fontWeight: 700, color: getDealColor(deal.deal_score) }}>
-                    {deal.deal_score?.toFixed(1)}
-                  </div>
-
                   <div>
                     <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
                       {deal.url ? (
@@ -369,14 +593,14 @@ export default function CarIntelDashboard() {
                           target="_blank"
                           rel="noreferrer"
                           onClick={(e) => e.stopPropagation()}
-                          style={{ fontSize: 13, fontWeight: 500, color: "#e2e8f0", textDecoration: "none" }}
+                          style={{ fontSize: 13, fontWeight: 500, color: "#0f172a", textDecoration: "none" }}
                           onMouseEnter={(e) => (e.currentTarget.style.textDecoration = "underline")}
                           onMouseLeave={(e) => (e.currentTarget.style.textDecoration = "none")}
                         >
                           {deal.year} {deal.make} {deal.model}
                         </a>
                       ) : (
-                        <div style={{ fontSize: 13, fontWeight: 500, color: "#e2e8f0" }}>
+                        <div style={{ fontSize: 13, fontWeight: 500, color: "#0f172a" }}>
                           {deal.year} {deal.make} {deal.model}
                         </div>
                       )}
@@ -393,7 +617,7 @@ export default function CarIntelDashboard() {
                             fontSize: 12,
                             color: "#64748b",
                             textDecoration: "none",
-                            border: "1px solid #1e3a4a",
+                            border: "1px solid #e2e8f0",
                             padding: "1px 6px",
                             borderRadius: 4,
                           }}
@@ -408,7 +632,7 @@ export default function CarIntelDashboard() {
                     </div>
                   </div>
 
-                  <div style={{ fontFamily: "'JetBrains Mono',monospace", fontSize: 13, fontWeight: 700, color: "#e2e8f0" }}>{fmt$(deal.price)}</div>
+                  <div style={{ fontFamily: "'JetBrains Mono',monospace", fontSize: 13, fontWeight: 700, color: "#0f172a" }}>{fmt$(deal.price)}</div>
                   <div style={{ fontFamily: "'JetBrains Mono',monospace", fontSize: 12, color: "#64748b" }}>{fmt$(deal.predicted_price)}</div>
                   <div style={{ fontFamily: "'JetBrains Mono',monospace", fontSize: 12, color: deal.savings >= 0 ? "#22c55e" : "#ef4444", fontWeight: 600 }}>
                     {deal.savings >= 0 ? "↓ " : "↑ "}
@@ -416,121 +640,61 @@ export default function CarIntelDashboard() {
                   </div>
                   <div style={{ fontFamily: "monospace", fontSize: 11, color: "#64748b" }}>{fmtN(deal.mileage)} mi</div>
                   <div style={{ fontFamily: "monospace", fontSize: 12, color: "#94a3b8" }}>{deal.location_state}</div>
-                  <DealBadge label={deal.deal_label} score={deal.deal_score} />
+                  <div style={{ fontSize: 15, color: getDealColor(deal.deal_score), letterSpacing: "0.05em" }}>
+                    {starsDisplay(deal.deal_score)}
+                  </div>
+                </div>
+
+                {selectedDeal?.listing_id === deal.listing_id && (
+                  <div style={{ background: "#f8fafc", border: "1px solid #2563eb33", borderTop: "2px solid #2563eb", borderBottom: "1px solid #f1f5f9", padding: "20px 24px", animation: "slideIn 0.15s ease" }}>
+                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
+                      <div>
+                        <div style={{ fontFamily: "'Bebas Neue',sans-serif", fontSize: 22, color: "#2563eb", letterSpacing: "0.05em" }}>
+                          {selectedDeal.year} {selectedDeal.make} {selectedDeal.model} — {selectedDeal.trim}
+                        </div>
+                        <div style={{ display: "flex", gap: 28, marginTop: 12, flexWrap: "wrap" }}>
+                          {[
+                            { label: "Listed Price", value: fmt$(selectedDeal.price), color: "#0f172a" },
+                            { label: "Market Value", value: fmt$(selectedDeal.predicted_price), color: "#64748b" },
+                            { label: "You Save", value: fmt$(selectedDeal.savings), color: selectedDeal.savings >= 0 ? "#22c55e" : "#ef4444" },
+                            { label: "Mileage", value: `${fmtN(selectedDeal.mileage)} mi`, color: "#94a3b8" },
+                            { label: "Deal Score", value: starsDisplay(selectedDeal.deal_score), color: getDealColor(selectedDeal.deal_score) },
+                            { label: "Location", value: `${selectedDeal.location_city || ""} ${selectedDeal.location_state || ""}`.trim(), color: "#94a3b8" },
+                            { label: "Accidents", value: selectedDeal.accident_count ?? 0, color: selectedDeal.accident_count > 0 ? "#ef4444" : "#22c55e" },
+                          ].map(({ label, value, color }) => (
+                            <div key={label}>
+                              <div style={{ fontFamily: "monospace", fontSize: 9, color: "#475569", letterSpacing: "0.1em", marginBottom: 4 }}>{label}</div>
+                              <div style={{ fontFamily: "'JetBrains Mono',monospace", fontSize: 15, fontWeight: 700, color }}>{value}</div>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                      <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                        {selectedDeal.url && !selectedDeal.url.includes("mock") && (
+                          <a href={selectedDeal.url} target="_blank" rel="noreferrer"
+                            style={{ background: "#2563eb", color: "#ffffff", borderRadius: 4, padding: "6px 14px", fontFamily: "monospace", fontSize: 11, fontWeight: 700, textDecoration: "none", letterSpacing: "0.05em" }}>
+                            VIEW LISTING →
+                          </a>
+                        )}
+                        <button onClick={() => setSelectedDeal(null)}
+                          style={{ background: "none", border: "1px solid #e2e8f0", color: "#475569", borderRadius: 4, padding: "6px 12px", cursor: "pointer", fontFamily: "monospace", fontSize: 11 }}>
+                          CLOSE ✕
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                )}
                 </div>
               ))
             )}
           </div>
 
-          {selectedDeal && (
-            <div style={{ marginTop: 16, background: "#0a1218", border: "1px solid #ff6b2b44", borderRadius: 6, padding: "20px 24px", animation: "slideIn 0.2s ease" }}>
-              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
-                <div>
-                  <div style={{ fontFamily: "'Bebas Neue',sans-serif", fontSize: 24, color: "#ff6b2b", letterSpacing: "0.05em" }}>
-                    {selectedDeal.year} {selectedDeal.make} {selectedDeal.model} — {selectedDeal.trim}
-                  </div>
-                  <div style={{ display: "flex", gap: 32, marginTop: 14, flexWrap: "wrap" }}>
-                    {[
-                      { label: "Listed Price", value: fmt$(selectedDeal.price), color: "#e2e8f0" },
-                      { label: "Market Value", value: fmt$(selectedDeal.predicted_price), color: "#64748b" },
-                      { label: "You Save", value: fmt$(selectedDeal.savings), color: selectedDeal.savings >= 0 ? "#22c55e" : "#ef4444" },
-                      { label: "Mileage", value: `${fmtN(selectedDeal.mileage)} mi`, color: "#94a3b8" },
-                      { label: "Deal Score", value: selectedDeal.deal_score?.toFixed(1), color: getDealColor(selectedDeal.deal_score) },
-                      { label: "Location", value: `${selectedDeal.location_city || ""} ${selectedDeal.location_state || ""}`.trim(), color: "#94a3b8" },
-                      { label: "Accidents", value: selectedDeal.accident_count ?? 0, color: selectedDeal.accident_count > 0 ? "#ef4444" : "#22c55e" },
-                      { label: "Days Listed", value: `${selectedDeal.days_listed}d`, color: "#94a3b8" },
-                    ].map(({ label, value, color }) => (
-                      <div key={label}>
-                        <div style={{ fontFamily: "monospace", fontSize: 9, color: "#475569", letterSpacing: "0.1em", marginBottom: 4 }}>{label}</div>
-                        <div style={{ fontFamily: "'JetBrains Mono',monospace", fontSize: 16, fontWeight: 700, color }}>{value}</div>
-                      </div>
-                    ))}
-                  </div>
-                </div>
-
-                <div style={{ display: "flex", flexDirection: "column", gap: 8, alignItems: "flex-end" }}>
-                  {selectedDeal.url && !selectedDeal.url.includes("mock") && (
-                    <a
-                      href={selectedDeal.url}
-                      target="_blank"
-                      rel="noreferrer"
-                      style={{ background: "#ff6b2b", color: "#000", borderRadius: 4, padding: "6px 14px", fontFamily: "monospace", fontSize: 11, fontWeight: 700, textDecoration: "none", letterSpacing: "0.05em" }}
-                    >
-                      VIEW LISTING →
-                    </a>
-                  )}
-                  <button
-                    onClick={() => {
-                      setSelectedDeal(null);
-                    }}
-                    style={{ background: "none", border: "1px solid #1e3a4a", color: "#475569", borderRadius: 4, padding: "6px 12px", cursor: "pointer", fontFamily: "monospace", fontSize: 11 }}
-                  >
-                    CLOSE ✕
-                  </button>
-                </div>
-              </div>
-
-              <div style={{ marginTop: 16, display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16 }}>
-                <div style={{ background: "#080e14", border: "1px solid #1e3a4a", borderRadius: 4, padding: "14px 16px" }}>
-                  <div style={{ fontFamily: "monospace", fontSize: 9, color: "#475569", letterSpacing: "0.1em", marginBottom: 10 }}>MARKETCHECK PRICE BENCHMARK</div>
-                  {benchmarkLoading ? (
-                    <div style={{ fontFamily: "monospace", fontSize: 11, color: "#475569" }}>Fetching benchmark...</div>
-                  ) : benchmark && !benchmark.error ? (
-                    <div style={{ display: "flex", gap: 24 }}>
-                      {[
-                        { label: "MC Predicted", value: fmt$(benchmark.mc_predicted_price), color: "#3b82f6" },
-                        { label: "Our Model", value: fmt$(selectedDeal.predicted_price), color: "#ff6b2b" },
-                        { label: "Listed Price", value: fmt$(selectedDeal.price), color: "#e2e8f0" },
-                      ].map(({ label, value, color }) => (
-                        <div key={label}>
-                          <div style={{ fontFamily: "monospace", fontSize: 9, color: "#475569", letterSpacing: "0.08em", marginBottom: 4 }}>{label}</div>
-                          <div style={{ fontFamily: "'JetBrains Mono',monospace", fontSize: 14, fontWeight: 700, color }}>{value}</div>
-                        </div>
-                      ))}
-                      {benchmark.mc_price_low && benchmark.mc_price_high && (
-                        <div>
-                          <div style={{ fontFamily: "monospace", fontSize: 9, color: "#475569", letterSpacing: "0.08em", marginBottom: 4 }}>MC RANGE</div>
-                          <div style={{ fontFamily: "'JetBrains Mono',monospace", fontSize: 12, color: "#64748b" }}>
-                            {fmt$(benchmark.mc_price_low)} – {fmt$(benchmark.mc_price_high)}
-                          </div>
-                        </div>
-                      )}
-                    </div>
-                  ) : (
-                    <div style={{ fontFamily: "monospace", fontSize: 11, color: "#475569" }}>No benchmark available</div>
-                  )}
-                </div>
-
-                <div style={{ background: "#080e14", border: "1px solid #1e3a4a", borderRadius: 4, padding: "14px 16px" }}>
-                  <div style={{ fontFamily: "monospace", fontSize: 9, color: "#475569", letterSpacing: "0.1em", marginBottom: 10 }}>MARKET SALES DATA (LAST 90 DAYS)</div>
-                  {salesLoading ? (
-                    <div style={{ fontFamily: "monospace", fontSize: 11, color: "#475569" }}>Fetching sales data...</div>
-                  ) : salesStats && !salesStats.error ? (
-                    <div style={{ display: "flex", gap: 24 }}>
-                      {[
-                        { label: "Total Sales", value: fmtN(salesStats.total_sales), color: "#e2e8f0" },
-                        { label: "Median DOM", value: salesStats.dom_median ? `${salesStats.dom_median}d` : "—", color: "#f59e0b" },
-                        { label: "CPO Sales", value: fmtN(salesStats.cpo_sales), color: "#94a3b8" },
-                      ].map(({ label, value, color }) => (
-                        <div key={label}>
-                          <div style={{ fontFamily: "monospace", fontSize: 9, color: "#475569", letterSpacing: "0.08em", marginBottom: 4 }}>{label}</div>
-                          <div style={{ fontFamily: "'JetBrains Mono',monospace", fontSize: 14, fontWeight: 700, color }}>{value}</div>
-                        </div>
-                      ))}
-                    </div>
-                  ) : (
-                    <div style={{ fontFamily: "monospace", fontSize: 11, color: "#475569" }}>No sales data available</div>
-                  )}
-                </div>
-              </div>
-            </div>
-          )}
         </div>
       </main>
 
-      <footer style={{ position: "relative", zIndex: 1, borderTop: "1px solid #1e3a4a", padding: "16px 32px", display: "flex", justifyContent: "space-between", alignItems: "center", marginTop: 40 }}>
-        <div style={{ fontFamily: "monospace", fontSize: 10, color: "#1e3a4a" }}>CARINTEL — XGBOOST PRICE MODEL</div>
-        <div style={{ fontFamily: "monospace", fontSize: 10, color: "#1e3a4a" }}>
+      <footer style={{ position: "relative", zIndex: 1, borderTop: "1px solid #e2e8f0", padding: "16px 32px", display: "flex", justifyContent: "space-between", alignItems: "center", marginTop: 40 }}>
+        <div style={{ fontFamily: "monospace", fontSize: 10, color: "#cbd5e1" }}>CARINTEL — XGBOOST PRICE MODEL</div>
+        <div style={{ fontFamily: "monospace", fontSize: 10, color: "#cbd5e1" }}>
           {stats.last_updated ? `LAST UPDATED: ${new Date(stats.last_updated).toLocaleTimeString()}` : ""}
         </div>
       </footer>
