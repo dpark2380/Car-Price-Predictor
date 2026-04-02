@@ -6,8 +6,9 @@ import argparse
 from loguru import logger
 
 from db.models import init_db, get_session
-from db.repository import ListingRepository, PredictionRepository, PopularityRepository
+from db.repository import ListingRepository, PredictionRepository, PopularityRepository, SalesStatsCacheRepository
 from scraper.data_ingest import DataIngestor
+from scraper.marketcheck_enrichment import enrich_with_sales_stats
 from ml import pipeline
 
 from scraper.api_usage import get_calls_today
@@ -76,7 +77,7 @@ def scrape_job(
     logger.info(f"▶ Scrape job done | new={total_new} updated={total_upd}")
 
 
-def score_job(repo: ListingRepository, pred_repo: PredictionRepository):
+def score_job(repo: ListingRepository, pred_repo: PredictionRepository, cache_repo: SalesStatsCacheRepository | None = None):
     """
     Computes predictions + deal scores and upserts into PricePrediction.
 
@@ -89,6 +90,9 @@ def score_job(repo: ListingRepository, pred_repo: PredictionRepository):
     if df.empty:
         logger.warning("No active listings to score")
         return
+
+    if cache_repo is not None:
+        df = enrich_with_sales_stats(df, cache_repo, fetch_missing=False)
 
     predictions = pipeline.score_listings(df) or []
     if predictions:
@@ -111,13 +115,16 @@ def popularity_job(repo: ListingRepository, pop_repo: PopularityRepository):
     logger.info("▶ Popularity job done")
 
 
-def ml_train_job(repo: ListingRepository):
+def ml_train_job(repo: ListingRepository, cache_repo: SalesStatsCacheRepository | None = None):
     logger.info("▶ ML train job starting")
 
     df = repo.get_active_listings_df()
     if df.empty:
         logger.warning("No data to train on")
         return
+
+    if cache_repo is not None:
+        df = enrich_with_sales_stats(df, cache_repo, fetch_missing=False)
 
     result = pipeline.train(df)
 
@@ -133,10 +140,11 @@ def run_all(engine):
     repo = ListingRepository(session)
     pred = PredictionRepository(session)
     pop = PopularityRepository(session)
+    cache = SalesStatsCacheRepository(session)
     try:
         scrape_job(repo, pred, pop)
-        ml_train_job(repo)
-        score_job(repo, pred)
+        ml_train_job(repo, cache)
+        score_job(repo, pred, cache)
         popularity_job(repo, pop)
     finally:
         session.close()
@@ -167,7 +175,8 @@ def main():
         session = get_session(engine)
         try:
             repo = ListingRepository(session)
-            ml_train_job(repo)           # ONLY train
+            cache = SalesStatsCacheRepository(session)
+            ml_train_job(repo, cache)
         finally:
             session.close()
         return
@@ -177,7 +186,8 @@ def main():
         try:
             repo = ListingRepository(session)
             pred = PredictionRepository(session)
-            score_job(repo, pred)        # ONLY score
+            cache = SalesStatsCacheRepository(session)
+            score_job(repo, pred, cache)
         finally:
             session.close()
         return
