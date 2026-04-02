@@ -1,3 +1,5 @@
 [
-  {"name": "used_cars", "url": "", "enabled": true}
+  {"name": "used_cars", "url": "", "enabled": false},
+  {"name": "trucks",    "url": "", "enabled": true},
+  {"name": "suvs",      "url": "", "enabled": true}
 ]

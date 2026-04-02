@@ -18,11 +18,66 @@ from scraper.api_usage import increment_call, ApiCallEvent
 load_dotenv()
 
 API_KEY = os.getenv("MARKETCHECK_API_KEY", "")
-ZIP     = os.getenv("MARKETCHECK_ZIP", "94119")   # Change this to switch markets
+ZIP     = os.getenv("MARKETCHECK_ZIP", "94119")   # Fallback if zip rotation is disabled
 RADIUS  = int(os.getenv("MARKETCHECK_RADIUS", 100))
 BASE    = "https://mc-api.marketcheck.com/v2"
 
+CURSORS_DIR      = Path("data/cursors")
+
+# Legacy paths kept for backward-compat reads on first migration
 PAGE_CURSOR_PATH = Path("data/page_cursor.json")
+ZIP_CURSOR_PATH  = Path("data/main_zip_cursor.json")
+
+
+def _cursor_paths(target: str) -> tuple[Path, Path]:
+    """Return (page_cursor_path, zip_cursor_path) for a given scrape target."""
+    d = CURSORS_DIR
+    return d / f"{target}_page.json", d / f"{target}_zip.json"
+
+
+SCRAPE_ZIPS = [
+    # California (core markets)
+    "90001",  # Los Angeles
+    "92101",  # San Diego
+    "94102",  # San Francisco
+    "95814",  # Sacramento
+    "93721",  # Fresno
+
+    # Pacific Northwest
+    "98101",  # Seattle, WA
+    "98402",  # Tacoma, WA
+    "97201",  # Portland, OR
+    "97401",  # Eugene, OR
+
+    # Southwest
+    "89101",  # Las Vegas, NV
+    "89502",  # Reno, NV
+    "85001",  # Phoenix, AZ
+    "85701",  # Tucson, AZ
+
+    # Mountain West
+    "80201",  # Denver, CO
+    "84101",  # Salt Lake City, UT
+]
+
+
+def _load_zip_cursor(path: Path | None = None) -> int:
+    p = path or ZIP_CURSOR_PATH
+    try:
+        # Fall back to legacy path if per-target file doesn't exist yet
+        if not p.exists() and path is not None and ZIP_CURSOR_PATH.exists():
+            return int(json.loads(ZIP_CURSOR_PATH.read_text()).get("idx", 0))
+        if p.exists():
+            return int(json.loads(p.read_text()).get("idx", 0))
+    except Exception:
+        pass
+    return 0
+
+
+def _save_zip_cursor(idx: int, path: Path | None = None) -> None:
+    p = path or ZIP_CURSOR_PATH
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps({"idx": idx}))
 
 
 def _make_listing_id(listing: dict) -> str:
@@ -85,8 +140,15 @@ def normalize_body_type(bt: str | None) -> str | None:
         "pickup": "Truck",
         "pickup truck": "Truck",
         "truck": "Truck",
+        "Cutaway": "Truck",
         "van": "Van",
         "minivan": "Van",
+        "mini van": "Van",
+        "car van": "Van",
+        "cargo van": "Van",
+        "passenger van": "Van",
+        "Combi": "Van",
+        "Mini Mpv": "Van",
     }
 
     return aliases.get(s, bt.strip())
@@ -146,18 +208,23 @@ def map_listing(raw: dict, source: str = "marketcheck") -> dict | None:
         return None
 
 
-def _load_page_cursor() -> int:
+def _load_page_cursor(path: Path | None = None) -> int:
+    p = path or PAGE_CURSOR_PATH
     try:
-        if PAGE_CURSOR_PATH.exists():
+        # Fall back to legacy path if per-target file doesn't exist yet
+        if not p.exists() and path is not None and PAGE_CURSOR_PATH.exists():
             return int(json.loads(PAGE_CURSOR_PATH.read_text()).get("page", 0))
+        if p.exists():
+            return int(json.loads(p.read_text()).get("page", 0))
     except Exception:
         pass
     return 0
 
 
-def _save_page_cursor(page: int) -> None:
-    PAGE_CURSOR_PATH.parent.mkdir(parents=True, exist_ok=True)
-    PAGE_CURSOR_PATH.write_text(json.dumps({"page": int(page)}))
+def _save_page_cursor(page: int, path: Path | None = None) -> None:
+    p = path or PAGE_CURSOR_PATH
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps({"page": int(page)}))
 
 
 class MarketCheckClient:
@@ -167,6 +234,8 @@ class MarketCheckClient:
         max_calls: int = 1,
         rotate_pages: bool = True,
         pages_in_rotation: int = 10,
+        page_cursor_path: Path | None = None,
+        zip_cursor_path: Path | None = None,
         **params,
     ) -> list:
         """
@@ -185,7 +254,15 @@ class MarketCheckClient:
         if pages_in_rotation < 1:
             pages_in_rotation = 1
 
-        page_cursor = _load_page_cursor() if rotate_pages else 0
+        # Rotate zip each run (per-target cursor)
+        if SCRAPE_ZIPS:
+            zip_idx = _load_zip_cursor(zip_cursor_path)
+            _active_zip = SCRAPE_ZIPS[zip_idx % len(SCRAPE_ZIPS)]
+            _save_zip_cursor((zip_idx + 1) % len(SCRAPE_ZIPS), zip_cursor_path)
+        else:
+            _active_zip = ZIP
+
+        page_cursor = _load_page_cursor(page_cursor_path) if rotate_pages else 0
         start_offset = (page_cursor % pages_in_rotation) * rows_per_call
 
         reset_to_zero = False
@@ -203,7 +280,7 @@ class MarketCheckClient:
                     f"{BASE}/search/car/active",
                     params={
                         "api_key":  API_KEY,
-                        "zip":      ZIP,
+                        "zip":      _active_zip,
                         "radius":   RADIUS,
                         "rows":     rows_per_call,
                         "start":    start,
@@ -232,31 +309,42 @@ class MarketCheckClient:
 
                 time.sleep(random.uniform(0.5, 1.2))
 
+            except requests.HTTPError as e:
+                if e.response is not None and e.response.status_code == 422:
+                    # 422 means start offset exceeds available listings — reset cursor
+                    logger.warning(f"  Marketcheck 422: start offset too high, resetting page cursor")
+                    reset_to_zero = True
+                else:
+                    logger.warning(f"  Marketcheck call failed: {e}")
+                    reset_to_zero = False
+                break
             except Exception as e:
                 logger.warning(f"  Marketcheck call failed: {e}")
-                # On error, don't advance cursor (safer)
                 reset_to_zero = False
                 break
 
         # Cursor update for next run
         if rotate_pages:
             if reset_to_zero:
-                _save_page_cursor(0)
+                _save_page_cursor(0, page_cursor_path)
             else:
                 next_page = (page_cursor + max_calls) % pages_in_rotation
-                _save_page_cursor(next_page)
+                _save_page_cursor(next_page, page_cursor_path)
 
         return all_listings
 
 
-# Map target names to API params
+# Map target names to additional Marketcheck API params.
+# body_style values accepted by Marketcheck: "Pickup Truck", "SUV", "Sedan", etc.
 TARGET_PARAMS = {
-    "used_cars": {},  # general — returns whatever Marketcheck prioritises
+    "used_cars": {},           # general — no body_type filter
+    "trucks":    {"body_style": "Pickup Truck"},
+    "suvs":      {"body_style": "SUV"},
 }
 
 
 class DataIngestor:
-    CALLS_PER_TARGET = 1
+    CALLS_PER_TARGET = 10
     ROWS_PER_CALL    = 50
 
     def __init__(self):
@@ -268,14 +356,19 @@ class DataIngestor:
         max_pages: int = 1,
         search_target: str = "used_cars",
     ) -> list:
-        logger.info(f"Fetching from Marketcheck: {search_target} (zip={ZIP}, radius={RADIUS}mi)")
+        logger.info(f"Fetching from Marketcheck: {search_target} (zip=rotating, radius={RADIUS}mi)")
         params = TARGET_PARAMS.get(search_target, {})
+
+        # Each target gets its own cursor files so runs don't interfere with each other
+        page_cursor_path, zip_cursor_path = _cursor_paths(search_target)
 
         raw_listings = self.client.fetch_listings(
             rows_per_call=self.ROWS_PER_CALL,
-            max_calls=self.CALLS_PER_TARGET,     # keep at 1 to avoid extra API calls
-            rotate_pages=True,                   # rotate pages across runs
-            pages_in_rotation=10,                # rotate through first 10 pages (0..9)
+            max_calls=self.CALLS_PER_TARGET,
+            rotate_pages=True,
+            pages_in_rotation=10,
+            page_cursor_path=page_cursor_path,
+            zip_cursor_path=zip_cursor_path,
             car_type="used",
             **params,
         )
