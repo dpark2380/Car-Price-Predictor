@@ -104,7 +104,46 @@ def _build_features_raw(df: pd.DataFrame) -> pd.DataFrame:
         .replace({"": "000"})
     )
 
+    # --- market benchmark features (from sales stats cache, may be NaN if not enriched) ---
+    out["market_median_price"] = pd.to_numeric(
+        df.get("market_median_price", pd.Series([np.nan] * len(df), index=df.index)),
+        errors="coerce",
+    )
+    out["market_dom_median"] = pd.to_numeric(
+        df.get("market_dom_median", pd.Series([np.nan] * len(df), index=df.index)),
+        errors="coerce",
+    )
+    # How over/under market is this listing (1.0 = at market, <1 = below, >1 = above)
+    raw_price = pd.to_numeric(df.get("price", pd.Series([np.nan] * len(df), index=df.index)), errors="coerce")
+    out["price_to_market"] = (raw_price / out["market_median_price"].replace(0, np.nan)).clip(0, 5)
+
     return out
+
+
+def _compute_cohort_stats(X: pd.DataFrame, y: pd.Series) -> pd.DataFrame:
+    """
+    Compute median price and listing count per (make, model, year) cohort
+    from training data only. Used to build market-relative features without
+    any external API calls.
+    """
+    src = X[["make", "model", "year"]].copy()
+    src["_price"] = y.to_numpy()
+    return (
+        src.groupby(["make", "model", "year"])["_price"]
+        .agg(cohort_median="median", cohort_count="count")
+    )
+
+
+def _apply_cohort_features(X: pd.DataFrame, cohort_stats: pd.DataFrame) -> pd.DataFrame:
+    """
+    Join cohort median price and count onto X by (make, model, year).
+    Missing cohorts get NaN/0 — the pipeline imputer handles these gracefully.
+    """
+    X = X.copy()
+    keys = pd.MultiIndex.from_arrays([X["make"], X["model"], X["year"]])
+    X["cohort_median_price"] = cohort_stats["cohort_median"].reindex(keys).to_numpy()
+    X["cohort_count"] = cohort_stats["cohort_count"].reindex(keys).fillna(0).to_numpy().astype(float)
+    return X
 
 
 def train(df: pd.DataFrame) -> dict | None:
@@ -136,6 +175,7 @@ def train(df: pd.DataFrame) -> dict | None:
         X_raw, y, test_size=0.2, random_state=42
     )
 
+    # Cohort stats computed from training data only (no API calls, no leakage into test)
     # log-space targets (this is what we train on)
     y_train_log = np.log1p(y_train)
     y_test_log = np.log1p(y_test)
@@ -149,6 +189,7 @@ def train(df: pd.DataFrame) -> dict | None:
         "accident_count", "owner_count",
         "is_luxury", "is_truck", "is_sports",
         "lux_age", "lux_mpy",
+        "market_median_price", "market_dom_median", "price_to_market",
     ]
     categorical_features = [
         "make", "model", "state",
@@ -187,19 +228,21 @@ def train(df: pd.DataFrame) -> dict | None:
 
     if HAS_XGB:
         candidates["xgb"] = XGBRegressor(
-            n_estimators=800,
-            max_depth=5,
-            learning_rate=0.05,
+            n_estimators=1500,
+            max_depth=6,
+            learning_rate=0.03,
             subsample=0.8,
-            colsample_bytree=0.8,
+            colsample_bytree=0.7,
+            min_child_weight=3,
+            gamma=0.05,
+            reg_alpha=0.05,
+            reg_lambda=1.0,
             random_state=42,
             verbosity=0,
-            objective="reg:squarederror",
+            objective="reg:absoluteerror",
         )
 
-    # luxury weighting (LinearRegression + RF accept sample_weight; XGB accepts too)
-    lux_w = 2.0
-    sample_weight = np.where(X_train["is_luxury"].to_numpy() >= 0.5, lux_w, 1.0)
+    sample_weight = np.ones(len(X_train))
 
     def _eval(y_true_np: np.ndarray, y_pred_np: np.ndarray) -> tuple[float, float]:
         mae = float(mean_absolute_error(y_true_np, y_pred_np))
@@ -218,20 +261,6 @@ def train(df: pd.DataFrame) -> dict | None:
             ("model", model),
         ])
 
-        fit_kwargs: dict = {"model__sample_weight": sample_weight}
-
-        # IMPORTANT: only pass eval_set/verbose to XGB
-        if name == "xgb":
-            fit_kwargs.update({
-                "model__eval_set": [(pipe.named_steps["preprocess"].fit_transform(X_test), y_test_log)]
-                # ^ NOTE: eval_set must be in the model's feature space. But since we're in a Pipeline,
-                # we can't easily inject transformed X_test without fitting preprocess first.
-                # So, we DO NOT pass eval_set via the pipeline. We'll compute training metrics manually below.
-            })
-
-        # Because passing eval_set through a sklearn Pipeline is awkward (needs transformed X),
-        # keep it simple: just fit the pipeline normally.
-        # (You still get proper test MAE/RMSE and train RMSE computed below.)
         pipe.fit(X_train, y_train_log, model__sample_weight=sample_weight)
 
         # ---- training RMSE (log-space) for ALL models (works consistently) ----
@@ -276,7 +305,21 @@ def train(df: pd.DataFrame) -> dict | None:
     logger.info(f"Selected model: {best_name} | MAE=${best['mae']:,.0f} RMSE=${best['rmse']:,.0f}")
 
     # -----------------------------
-    # 6) Permutation importance on RAW features (24 cols)
+    # 6) Calibration — correct systematic bias in log space
+    # -----------------------------
+    # Compute median residual on training set. Subtracting this from future
+    # log-space predictions ensures the median training error is zero, giving
+    # a balanced mix of positive and negative savings at scoring time.
+    test_log_preds = pipe.predict(X_test)
+    log_calibration = float(np.median(test_log_preds - y_test_log.to_numpy()))
+    direction = "over" if log_calibration > 0 else "under"
+    logger.info(
+        f"Calibration offset (log, test set): {log_calibration:.4f}  "
+        f"(≈ {abs(np.expm1(-abs(log_calibration)) * 100):.1f}% systematic {direction}prediction corrected)"
+    )
+
+    # -----------------------------
+    # 7) Permutation importance on RAW features (24 cols)
     # -----------------------------
     try:
         pi = permutation_importance(
@@ -307,10 +350,8 @@ def train(df: pd.DataFrame) -> dict | None:
         "version": version,
         "selected_model": best_name,
         "metrics": metrics,
+        "log_calibration": log_calibration,
     }
-
-    os.makedirs("models", exist_ok=True)
-    joblib.dump(payload, MODEL_PATH)
 
     os.makedirs("models", exist_ok=True)
     joblib.dump(payload, MODEL_PATH)
@@ -386,14 +427,14 @@ def _deal_score_from_prices(actual: float, predicted: float) -> float:
 
 def _deal_label(score: float) -> str:
     if score >= 90:
-        return "Hidden Gem"
+        return "5 Stars"
     if score >= 75:
-        return "Great Deal"
+        return "4 Stars"
     if score >= 60:
-        return "Good Deal"
+        return "3 Stars"
     if score >= 45:
-        return "Fair Price"
-    return "Overpriced"
+        return "2 Stars"
+    return "1 Star"
 
 
 def score_listings(df: pd.DataFrame) -> list[dict]:
@@ -422,7 +463,8 @@ def score_listings(df: pd.DataFrame) -> list[dict]:
 
     logger.info(f"Scoring {len(df)} listings…")
     X = _build_features_raw(df)
-    preds = np.expm1(model.predict(X))
+    log_calibration = payload.get("log_calibration", 0.0)
+    preds = np.expm1(model.predict(X) - log_calibration)
 
     # Keep alignment with df rows
     df = df.reset_index(drop=True)
